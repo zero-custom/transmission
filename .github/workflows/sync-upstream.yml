@@ -1,0 +1,26 @@
+name: Sync Upstream
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+      - name: Run sync script
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/sync-upstream.sh
