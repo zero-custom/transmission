@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 # musl 变体：对应上游 CI alpine-musl job（alpine:latest 容器内原生构建，clang 编译器）
 # musl 1.2.x；amd64/arm64/armv7 由 buildx+QEMU 支持
-FROM alpine:3.21 AS builder
+# pin 3.24: fast_float 的 apk 包仅 3.22+ 提供（3.21 无）；clang 22.1.3 本地验证通过
+FROM alpine:3.24 AS builder
 RUN apk add --no-cache \
         binutils build-base ca-certificates clang cmake \
         curl-dev fast_float fmt-dev gettext-dev \

@@ -16,6 +16,14 @@ case "$LIBC" in
   *) echo "::error::unknown libc: $LIBC (glibc|musl)"; exit 1 ;;
 esac
 
+# arch → BuildKit 平台字符串（armv7 的合法平台是 linux/arm/v7，不是 linux/armv7）
+case "$ARCH" in
+  amd64) PLATFORM="linux/amd64" ;;
+  arm64) PLATFORM="linux/arm64" ;;
+  armv7) PLATFORM="linux/arm/v7" ;;
+  *) echo "::error::unknown arch: $ARCH (amd64|arm64|armv7)"; exit 1 ;;
+esac
+
 notify_failure() { # tag, libc, arch, reason, detail
   local tag="$1" libc="$2" arch="$3" reason="$4" detail="${5:-}"
   local title="build: $tag ($libc/$arch) failed" existing
@@ -55,7 +63,7 @@ EOF
       || { notify_failure "$tag" "$LIBC" "$ARCH" "patch apply failed" "$(basename "$patch")"; exit 1; }
   done
   ( cd "$wt" && docker buildx build \
-      --platform "linux/$ARCH" \
+      --platform "$PLATFORM" \
       --output "type=local,dest=$dest" \
       -f Dockerfile.build . ) \
     || { notify_failure "$tag" "$LIBC" "$ARCH" "build failed"; exit 1; }
