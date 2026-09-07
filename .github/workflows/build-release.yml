@@ -1,0 +1,115 @@
+name: Build Patched Release
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        type: string
+        required: false
+        description: '上游 tag（如 4.1.3）；留空则自动检测'
+      force:
+        type: boolean
+        required: false
+        default: false
+        description: 'tag 已构建时强制重建（生成下一个 -pN；失败不建 issue）'
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: build-release
+  cancel-in-progress: false
+
+jobs:
+  detect-tags:
+    runs-on: ubuntu-latest
+    outputs:
+      tags: ${{ steps.detect.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Detect new upstream tags
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "tags=$(.github/scripts/detect-new-tags.sh '${{ inputs.upstream_tag }}' '${{ inputs.force == true && '1' || '0' }}' | jq -c .)" >> "$GITHUB_OUTPUT"
+
+  prepare-branch:
+    needs: detect-tags
+    runs-on: ubuntu-latest
+    outputs:
+      tags: ${{ steps.prepare.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+      # 补丁作为提交放入 fork 分支 <tag>（= upstream tag + 1 个补丁提交），供 build job 直接检出
+      - name: Prepare patched branch
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo '${{ needs.detect-tags.outputs.tags }}' | jq -c . > /tmp/tags.json
+          # 脚本 stdout = workflow 命令(::notice:: 等，runner 解析) + 末行 JSON。
+          # tee 分流：runner 收到完整流；从文件取末行给 jq，避免 ::命令 污染 jq 输入。
+          .github/scripts/prepare-branch.sh /tmp/tags.json | tee /tmp/prepared.out
+          tags=$(tail -1 /tmp/prepared.out | jq -c . 2>/dev/null)
+          [ -n "${tags:-}" ] || tags='["__skip__"]'
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: [detect-tags, prepare-branch]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        libc: [glibc, musl]
+        arch: [amd64, arm64, armv7]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build patched binaries for ${{ matrix.libc }}/${{ matrix.arch }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo '${{ needs.prepare-branch.outputs.tags }}' | jq -c . > /tmp/tags.json
+          .github/scripts/build-patched.sh '${{ matrix.arch }}' '${{ matrix.libc }}' /tmp/tags.json '${{ inputs.force == true && '1' || '0' }}'
+      - name: Upload artifacts
+        if: ${{ needs.prepare-branch.outputs.tags != '["__skip__"]' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: build-${{ matrix.libc }}-${{ matrix.arch }}
+          path: out-*/
+          if-no-files-found: error
+
+  publish:
+    needs: [detect-tags, prepare-branch, build]
+    if: always() && needs.detect-tags.result == 'success' && needs.prepare-branch.result == 'success' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: build-*
+          merge-multiple: true
+          path: artifacts
+      - name: Flatten artifact tarballs
+        run: |
+          mkdir -p artifacts
+          find artifacts -type f -name '*.tar.gz' -exec mv -t artifacts {} +
+      - name: Publish fork releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo '${{ needs.prepare-branch.outputs.tags }}' | jq -c . > /tmp/tags.json
+          .github/scripts/publish-release.sh /tmp/tags.json artifacts

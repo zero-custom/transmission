@@ -1,0 +1,1798 @@
+diff --git a/libtransmission/CMakeLists.txt b/libtransmission/CMakeLists.txt
+index 76b6120fa..4d48e26ed 100644
+--- a/libtransmission/CMakeLists.txt
++++ b/libtransmission/CMakeLists.txt
+@@ -103,6 +103,8 @@ target_sources(${TR_NAME}
+         port-forwarding-upnp.h
+         port-forwarding.cc
+         port-forwarding.h
++        proxy-protocol.cc
++        proxy-protocol.h
+         quark.cc
+         quark.h
+         resume.cc
+diff --git a/libtransmission/proxy-protocol.cc b/libtransmission/proxy-protocol.cc
+new file mode 100644
+index 000000000..30471111c
+--- /dev/null
++++ b/libtransmission/proxy-protocol.cc
+@@ -0,0 +1,507 @@
++// This file Copyright (C) 2026.
++// It may be used under GPLv2 (SPDX: GPL-2.0-only), GPLv3 (SPDX: GPL-3.0-only),
++// or any future license endorsed by Mnemosyne LLC.
++
++// PROXY protocol (HAProxy) support for gost-relayed peer connections.
++//
++// gost injects a PROXY protocol header at the start of every relayed stream
++// (TCP) or as the first datagram of every relayed UDP session, describing the
++// original client address. Without parsing it, transmission sees gost's own
++// address instead of the real client's. This module:
++//   - parses v1 (text) and v2 (binary) headers (see https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt)
++//   - strips the header from accepted TCP streams and rewrites the peer address
++//   - records a real<->actual address mapping for relayed UDP sessions and
++//     rewrites both directions, so µTP/DHT see the real client while replies
++//     still traverse the gost relay instead of dying in the bridge network.
++
++#include "libtransmission/proxy-protocol.h"
++
++#include <array>
++#include <cerrno> // errno, EAGAIN, EWOULDBLOCK
++#include <charconv> // std::from_chars
++#include <chrono> // std::chrono literals
++#include <cstring> // std::memcpy
++#include <string_view>
++#include <utility>
++
++#ifndef _WIN32
++#include <poll.h> // poll(), pollfd
++#endif
++
++#include <fmt/format.h>
++
++#include "libtransmission/log.h"
++
++using namespace std::literals;
++
++namespace tr::proxy_protocol
++{
++    namespace
++    {
++        // v2 fixed header: 12-byte signature + version/command + family/proto + 2-byte length.
++        constexpr size_t V2FixedHeaderLen = 16;
++
++        // v1 headers are at most 107 bytes including the trailing CRLF (spec).
++        constexpr size_t V1MaxHeaderLen = 107;
++
++        // Enough to hold any v1 header and every sane v2 address block.
++        constexpr size_t MaxPeekLen = 512;
++
++        // How long handleTcpAccepted waits for a complete PROXY protocol header.
++        // gost writes the header right after opening the upstream connection and
++        // the last hop is a local bridge, so by the time accept() is processed
++        // the header is normally already buffered; the budget only covers the
++        // accept-vs-write race and a header that arrives split across segments.
++        // It is bounded so a peer that sends nothing (or only a header prefix)
++        // cannot stall the session thread for long.
++        auto constexpr TcpHeaderWait = std::chrono::milliseconds{ 250 };
++
++        [[nodiscard]] bool would_block() noexcept
++        {
++#ifdef _WIN32
++            return WSAGetLastError() == WSAEWOULDBLOCK;
++#else
++            return errno == EAGAIN || errno == EWOULDBLOCK;
++#endif
++        }
++
++#ifndef _WIN32
++        // Wait until `fd` becomes readable or `deadline` passes. Returns true
++        // when the socket became readable and more bytes may be available.
++        [[nodiscard]] bool wait_readable(tr_socket_t fd, std::chrono::steady_clock::time_point deadline) noexcept
++        {
++            for (;;)
++            {
++                auto const now = std::chrono::steady_clock::now();
++                if (now >= deadline)
++                {
++                    return false;
++                }
++
++                auto pfd = pollfd{ fd, POLLIN, 0 };
++                auto const timeout_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
++                auto const ret = poll(&pfd, 1, static_cast<int>(timeout_ms));
++                if (ret >= 0)
++                {
++                    return ret > 0 && (pfd.revents & POLLIN) != 0;
++                }
++                if (errno != EINTR) // poll was interrupted by a signal; retry with the remaining budget
++                {
++                    return false;
++                }
++            }
++        }
++#else
++        // Windows is not a gost-relay target; fall back to the single-attempt path.
++        [[nodiscard]] bool wait_readable(tr_socket_t, std::chrono::steady_clock::time_point) noexcept
++        {
++            return false;
++        }
++#endif
++
++        [[nodiscard]] bool starts_with(std::byte const* data, size_t len, std::string_view prefix) noexcept
++        {
++            auto const* const bytes = reinterpret_cast<char const*>(data);
++            return len >= std::size(prefix) &&
++                std::equal(std::data(prefix), std::data(prefix) + std::size(prefix), bytes);
++        }
++
++        // data[crlf_pos] == '\r', data[crlf_pos + 1] == '\n'; the line starts
++        // with "PROXY ". Returns nullopt when the line is malformed.
++        [[nodiscard]] std::optional<HeaderInfo> parse_v1_line(std::byte const* data, size_t crlf_pos) noexcept
++        {
++            auto const header_len = crlf_pos + 2;
++            if (header_len > V1MaxHeaderLen)
++            {
++                return std::nullopt;
++            }
++
++            // Everything between "PROXY " and the CRLF.
++            auto const remain = std::string_view{ reinterpret_cast<char const*>(data) + 6, crlf_pos - 6 };
++            auto tokens = std::array<std::string_view, 5>{};
++            auto n_tokens = size_t{ 0 };
++            auto start = size_t{ 0 };
++
++            for (size_t i = 0; i <= std::size(remain) && n_tokens < std::size(tokens); ++i)
++            {
++                if (i == std::size(remain) || remain[i] == ' ')
++                {
++                    if (i > start)
++                    {
++                        tokens[n_tokens++] = remain.substr(start, i - start);
++                    }
++                    start = i + 1;
++                }
++            }
++
++            if (n_tokens == 0)
++            {
++                return std::nullopt;
++            }
++
++            if (tokens[0] == "UNKNOWN"sv)
++            {
++                return HeaderInfo{ {}, header_len };
++            }
++
++            if (n_tokens != 5)
++            {
++                return std::nullopt;
++            }
++
++            // PROXY <proto> <src-ip> <dst-ip> <src-port> <dst-port>
++            auto const parse_port = [](std::string_view const s) -> std::optional<tr_port>
++            {
++                auto val = 0U;
++                auto const [ptr, ec] = std::from_chars(std::data(s), std::data(s) + std::size(s), val, 10);
++                if (ec != std::errc{} || ptr != std::data(s) + std::size(s) || val > 65535U)
++                {
++                    return std::nullopt;
++                }
++                return tr_port::from_host(static_cast<uint16_t>(val));
++            };
++
++            auto const src = tr_address::from_string(tokens[1]);
++            auto const sport = parse_port(tokens[3]);
++            if (!src || !sport)
++            {
++                return std::nullopt;
++            }
++
++            if (tokens[0] == "TCP4"sv && src->is_ipv4())
++            {
++                return HeaderInfo{ tr_socket_address{ *src, *sport }, header_len };
++            }
++            if (tokens[0] == "TCP6"sv && src->is_ipv6())
++            {
++                return HeaderInfo{ tr_socket_address{ *src, *sport }, header_len };
++            }
++
++            return std::nullopt;
++        }
++
++        // data starts with the v2 signature. Returns nullopt when the header
++        // (incl. the length-declared address block) is not fully buffered.
++        [[nodiscard]] std::optional<HeaderInfo> parse_v2_header(std::byte const* data, size_t len) noexcept
++        {
++            if (len < V2FixedHeaderLen)
++            {
++                return std::nullopt;
++            }
++
++            auto const ver_cmd = data[12]; // 0x20 = v2 PROXY, 0x21 = v2 LOCAL
++            auto const fam = data[13]; // 0x11/0x12 = AF_INET stream/dgram, 0x21/0x22 = AF_INET6
++            auto const addr_len = (static_cast<size_t>(data[14]) << 8U) | static_cast<size_t>(data[15]);
++            auto const header_len = V2FixedHeaderLen + addr_len;
++            if (len < header_len)
++            {
++                return std::nullopt;
++            }
++
++            // LOCAL command and the UNSPEC family carry no client address.
++            if (ver_cmd != std::byte{ 0x20 } || fam == std::byte{ 0x00 })
++            {
++                return HeaderInfo{ {}, header_len };
++            }
++
++            auto const* const p = data + V2FixedHeaderLen;
++            switch (fam)
++            {
++            case std::byte{ 0x11 }: // AF_INET, STREAM
++            case std::byte{ 0x12 }: // AF_INET, DGRAM
++                if (addr_len >= 12)
++                {
++                    return HeaderInfo{ tr_socket_address::from_compact_ipv4(p).first, header_len };
++                }
++                break;
++            case std::byte{ 0x21 }: // AF_INET6, STREAM
++            case std::byte{ 0x22 }: // AF_INET6, DGRAM
++                if (addr_len >= 36)
++                {
++                    return HeaderInfo{ tr_socket_address::from_compact_ipv6(p).first, header_len };
++                }
++                break;
++            default:
++                break;
++            }
++
++            // Declared family is not AF_INET/6, or the address block is too
++            // short: nothing to rewrite, but the header is still consumed.
++            return HeaderInfo{ {}, header_len };
++        }
++    } // namespace
++
++    std::pair<ParseResult, std::optional<HeaderInfo>> parse(std::byte const* data, size_t len) noexcept
++    {
++        // v2: 12-byte signature + 4-byte fixed header
++        if (len >= std::size(V2Signature) &&
++            std::equal(std::data(V2Signature), std::data(V2Signature) + std::size(V2Signature), data))
++        {
++            if (auto const header = parse_v2_header(data, len); header)
++            {
++                return { ParseResult::Complete, header };
++            }
++            return { ParseResult::Incomplete, std::nullopt };
++        }
++
++        // partial v2 signature
++        if (std::equal(data, data + len, std::data(V2Signature), std::data(V2Signature) + len))
++        {
++            return { ParseResult::Incomplete, std::nullopt };
++        }
++
++        // v1: "PROXY " + a single CRLF-terminated line
++        if (starts_with(data, len, "PROXY "sv))
++        {
++            for (size_t i = 6; i + 1 < len; ++i)
++            {
++                if (data[i] == std::byte{ '\r' } && data[i + 1] == std::byte{ '\n' })
++                {
++                    if (auto const header = parse_v1_line(data, i); header)
++                    {
++                        return { ParseResult::Complete, header };
++                    }
++                    return { ParseResult::NotHeader, std::nullopt };
++                }
++            }
++            return { ParseResult::Incomplete, std::nullopt };
++        }
++
++        // partial "PROXY " prefix
++        if (len < 6 &&
++            std::equal(
++                reinterpret_cast<char const*>(data),
++                reinterpret_cast<char const*>(data) + len,
++                std::data("PROXY "sv)))
++        {
++            return { ParseResult::Incomplete, std::nullopt };
++        }
++
++        return { ParseResult::NotHeader, std::nullopt };
++    }
++
++    // --- Manager
++
++    Manager::Manager(tr_proxy_protocol_mode mode) noexcept
++        : mode_{ mode }
++    {
++    }
++
++    void Manager::record(tr_socket_address const& real, tr_socket_address const& actual) noexcept
++    {
++        auto const now = std::chrono::steady_clock::now();
++
++        // Keep both indices consistent when an address is re-bound. A real that
++        // was already mapped to a different actual leaves a stale reverse entry
++        // behind (and vice versa), which would otherwise never be reclaimed and
++        // could attribute datagrams to the wrong session.
++        if (auto const it = sessions_.find(real); it != std::end(sessions_))
++        {
++            if (!(it->second.actual == actual))
++            {
++                actual_to_real_.erase(it->second.actual);
++            }
++            it->second = Session{ actual, now };
++        }
++        else
++        {
++            sessions_.emplace(real, Session{ actual, now });
++        }
++
++        if (auto const it = actual_to_real_.find(actual); it != std::end(actual_to_real_))
++        {
++            if (!(it->second == real))
++            {
++                sessions_.erase(it->second);
++            }
++            it->second = real;
++        }
++        else
++        {
++            actual_to_real_.emplace(actual, real);
++        }
++
++        // Opportunistic pruning, at most once a minute.
++        if (last_prune_.time_since_epoch().count() == 0 || now - last_prune_ >= std::chrono::minutes{ 1 })
++        {
++            last_prune_ = now;
++            prune(now);
++        }
++    }
++
++    void Manager::prune(std::chrono::steady_clock::time_point now) noexcept
++    {
++        // A relayed session that has been idle for 15 minutes is gone; gost
++        // closes its relay well before that, and DHT queries are refreshed
++        // far more often.
++        auto const cutoff = now - std::chrono::minutes{ 15 };
++
++        for (auto it = std::begin(sessions_); it != std::end(sessions_);)
++        {
++            if (it->second.last_seen < cutoff)
++            {
++                actual_to_real_.erase(it->second.actual);
++                it = sessions_.erase(it);
++            }
++            else
++            {
++                ++it;
++            }
++        }
++    }
++
++    bool Manager::handleTcpAccepted(tr_socket_t fd, tr_socket_address& socket_address)
++    {
++        if (mode_ == TR_PROXY_PROTOCOL_OFF)
++        {
++            return true;
++        }
++
++        auto buf = std::array<std::byte, MaxPeekLen>{};
++        auto const deadline = std::chrono::steady_clock::now() + TcpHeaderWait;
++
++        for (;;)
++        {
++            auto const n_read = recv(fd, reinterpret_cast<char*>(std::data(buf)), std::size(buf), MSG_PEEK);
++            if (n_read < 0 && would_block())
++            {
++                // Nothing buffered yet: accept() fired before the relay's header
++                // write arrived. Require mode cannot tell a delayed header from a
++                // missing one, so it waits briefly for the header; Allow mode
++                // keeps the connection, since a headerless stream is
++                // indistinguishable from a plain peer that has not spoken yet.
++                if (mode_ == TR_PROXY_PROTOCOL_REQUIRE && wait_readable(fd, deadline))
++                {
++                    continue;
++                }
++                return mode_ != TR_PROXY_PROTOCOL_REQUIRE;
++            }
++
++            if (n_read <= 0) // orderly EOF or a non-EAGAIN error: nothing more will come
++            {
++                return false;
++            }
++
++            auto const [result, header] = parse(std::data(buf), static_cast<size_t>(n_read));
++            if (result == ParseResult::Complete)
++            {
++                // Consume exactly the header; the payload stays in the kernel buffer.
++                (void)recv(fd, reinterpret_cast<char*>(std::data(buf)), header->header_len, 0);
++                if (header->source.is_valid())
++                {
++                    socket_address = header->source;
++                }
++                tr_logAddTrace(fmt::format(
++                    "PROXY protocol: accepted connection from {} (header: {} bytes)",
++                    socket_address.display_name(),
++                    header->header_len));
++                return true;
++            }
++
++            if (result == ParseResult::Incomplete)
++            {
++                // The stream starts with a header prefix that is not complete
++                // yet; it should be finished by the next segment. Wait for it
++                // within the budget instead of misjudging the connection.
++                if (wait_readable(fd, deadline))
++                {
++                    continue;
++                }
++                // The header never arrived in full. A plain peer cannot produce
++                // a PROXY prefix, so dropping beats accepting a stream whose
++                // first bytes we would not be able to strip.
++                tr_logAddTrace("PROXY protocol: incomplete header; dropping connection");
++                return false;
++            }
++
++            // ParseResult::NotHeader: a plain connection, not relayed by gost.
++            return mode_ != TR_PROXY_PROTOCOL_REQUIRE;
++        }
++    }
++
++    bool Manager::handleUdpDatagram(void const* buf, size_t len, sockaddr* from, socklen_t* fromlen)
++    {
++        if (mode_ == TR_PROXY_PROTOCOL_OFF)
++        {
++            return false;
++        }
++
++        auto const [result, header] = parse(static_cast<std::byte const*>(buf), len);
++        if (result == ParseResult::Complete && header.has_value())
++        {
++            // gost sends the header as its own datagram, ahead of the payload.
++            if (header->source.is_valid())
++            {
++                if (auto const actual = tr_socket_address::from_sockaddr(from); actual)
++                {
++                    record(header->source, *actual);
++                }
++            }
++            tr_logAddTrace("PROXY protocol: UDP session header received");
++            return true; // drop the header datagram, do not dispatch it
++        }
++
++        // Payload datagram: rewrite the sender to the real client if mapped.
++        if (auto const actual = tr_socket_address::from_sockaddr(from); actual)
++        {
++            if (auto const it = actual_to_real_.find(*actual); it != std::end(actual_to_real_))
++            {
++                auto const real = it->second;
++                if (auto const [storage, storage_len] = real.to_sockaddr(); storage_len > 0)
++                {
++                    std::memcpy(from, &storage, sizeof(storage));
++                    *fromlen = storage_len;
++                    if (auto const sit = sessions_.find(real); sit != std::end(sessions_))
++                    {
++                        sit->second.last_seen = std::chrono::steady_clock::now();
++                    }
++                }
++            }
++        }
++        return false;
++    }
++
++    std::optional<tr_socket_address> Manager::rewriteOutbound(sockaddr const* to)
++    {
++        if (mode_ == TR_PROXY_PROTOCOL_OFF)
++        {
++            return std::nullopt;
++        }
++
++        auto const real = tr_socket_address::from_sockaddr(to);
++        if (!real)
++        {
++            return std::nullopt;
++        }
++
++        if (auto const it = sessions_.find(*real); it != std::end(sessions_))
++        {
++            it->second.last_seen = std::chrono::steady_clock::now();
++            return it->second.actual;
++        }
++        return std::nullopt;
++    }
++
++    // --- socket registry (for libdht's sendto hook, which has no session pointer)
++
++    namespace
++    {
++        std::map<tr_socket_t, Manager*> g_socket_managers;
++    } // namespace
++
++    void register_socket(tr_socket_t sockfd, Manager& manager)
++    {
++        g_socket_managers[sockfd] = &manager;
++    }
++
++    void unregister_socket(tr_socket_t sockfd)
++    {
++        g_socket_managers.erase(sockfd);
++    }
++
++    Manager* find_manager(tr_socket_t sockfd) noexcept
++    {
++        auto const it = g_socket_managers.find(sockfd);
++        return it == std::end(g_socket_managers) ? nullptr : it->second;
++    }
++} // namespace tr::proxy_protocol
+diff --git a/libtransmission/proxy-protocol.h b/libtransmission/proxy-protocol.h
+new file mode 100644
+index 000000000..40f7e135d
+--- /dev/null
++++ b/libtransmission/proxy-protocol.h
+@@ -0,0 +1,148 @@
++// This file Copyright (C) 2026.
++// It may be used under GPLv2 (SPDX: GPL-2.0-only), GPLv3 (SPDX: GPL-3.0-only),
++// or any future license endorsed by Mnemosyne LLC.
++
++#pragma once
++
++#ifndef __TRANSMISSION__
++#error only libtransmission should #include this header.
++#endif
++
++#include <array> // std::array
++#include <chrono> // std::chrono::steady_clock
++#include <cstddef> // size_t, std::byte
++#include <cstdint> // uint8_t
++#include <map>
++#include <optional>
++
++#ifdef _WIN32
++#include <winsock2.h> // sockaddr, socklen_t
++#else
++#include <sys/socket.h> // sockaddr, socklen_t
++#endif
++
++#include "libtransmission/net.h" // tr_socket_address, tr_socket_t
++#include "libtransmission/transmission.h" // tr_proxy_protocol_mode
++
++namespace tr::test
++{
++
++class ProxyProtocolTest;
++
++} // namespace tr::test
++
++namespace tr::proxy_protocol
++{
++    // PROXY protocol v2 signature -- the first 12 bytes of every v2 header.
++    // Declared here (not in the .cc) so the unit tests build v2 headers from
++    // the same bytes the parser matches against.
++    inline constexpr std::array<std::byte, 12> V2Signature = {
++        std::byte{ 0x0D }, std::byte{ 0x0A }, std::byte{ 0x0D }, std::byte{ 0x0A }, std::byte{ 0x00 },
++        std::byte{ 0x0D }, std::byte{ 0x0A }, std::byte{ 0x51 }, std::byte{ 0x55 }, std::byte{ 0x49 },
++        std::byte{ 0x54 }, std::byte{ 0x0A },
++    };
++
++    // How connections that lack a PROXY protocol header are treated.
++    // Maps 1:1 onto tr_proxy_protocol_mode (transmission.h).
++    enum class ParseResult : uint8_t
++    {
++        NotHeader, // data does not start with a PROXY protocol header
++        Complete, // data starts with a complete PROXY protocol header
++        Incomplete // data starts with a header prefix, but the header is not fully buffered
++    };
++
++    struct HeaderInfo
++    {
++        tr_socket_address source; // SRC address carried by the header; invalid for LOCAL/UNKNOWN
++        size_t header_len; // total header size in bytes; strip this many bytes from the stream
++    };
++
++    // Parse a PROXY protocol header at the beginning of [data, data + len).
++    // PROXY protocol v1 (text) and v2 (binary) are supported.
++    [[nodiscard]] std::pair<ParseResult, std::optional<HeaderInfo>> parse(std::byte const* data, size_t len) noexcept;
++
++    // Session-wide PROXY protocol state: the connection mode plus the UDP
++    // real<->actual address mapping used for gost-relayed (PROXY protocol)
++    // traffic. All methods are called from the session (libevent) thread only,
++    // so no locking is required.
++    class Manager
++    {
++    public:
++        explicit Manager(tr_proxy_protocol_mode mode = TR_PROXY_PROTOCOL_OFF) noexcept;
++
++        void setMode(tr_proxy_protocol_mode mode) noexcept
++        {
++            mode_ = mode;
++        }
++
++        [[nodiscard]] tr_proxy_protocol_mode mode() const noexcept
++        {
++            return mode_;
++        }
++
++        // --- TCP: call right after accept(), before creating the peer socket.
++        // Peeks the accepted socket; if it starts with a complete PROXY protocol
++        // header, consumes the header and rewrites socket_address to the SRC
++        // address from the header. Returns false when the connection must be
++        // dropped. A connection whose header has not (fully) arrived yet is
++        // waited for within a short bounded budget before deciding, so Require
++        // mode does not mistake a delayed header for a missing one, and Allow
++        // mode does not accept a stream it cannot strip the header from.
++        [[nodiscard]] bool handleTcpAccepted(tr_socket_t fd, tr_socket_address& socket_address);
++
++        // --- UDP: call on every inbound datagram, before protocol dispatch.
++        // If the datagram is a PROXY protocol header, records the real<->actual
++        // address mapping and returns true (caller drops the datagram; gost
++        // sends the header in its own datagram, the payload follows in the
++        // next one). Otherwise, if the datagram's source address is mapped,
++        // rewrites *from / *fromlen to the real client address and returns
++        // false (caller dispatches normally).
++        [[nodiscard]] bool handleUdpDatagram(void const* buf, size_t len, sockaddr* from, socklen_t* fromlen);
++
++        // --- UDP outbound: if the destination names a relayed (real client)
++        // address, rewrites it to the relay's actual address so the reply
++        // traverses the relay. Returns the rewritten destination when a mapping
++        // exists (refreshing the session timeout), or nullopt when the
++        // destination is unmapped and the caller should send as-is.
++        [[nodiscard]] std::optional<tr_socket_address> rewriteOutbound(sockaddr const* to);
++
++    private:
++        friend class tr::test::ProxyProtocolTest; // for the clock-driven prune tests
++
++        void record(tr_socket_address const& real, tr_socket_address const& actual) noexcept;
++        void prune(std::chrono::steady_clock::time_point now) noexcept;
++
++        tr_proxy_protocol_mode mode_ = TR_PROXY_PROTOCOL_OFF;
++
++        struct Session
++        {
++            tr_socket_address actual;
++            std::chrono::steady_clock::time_point last_seen;
++        };
++
++        // Two indices over the same mapping, keyed by the real client address
++        // and by the relay (actual) address. record() keeps them in sync: every
++        // session appears in exactly one entry of each map.
++        std::map<tr_socket_address, Session> sessions_; // keyed by the real client address
++        std::map<tr_socket_address, tr_socket_address> actual_to_real_; // reverse index
++
++        std::chrono::steady_clock::time_point last_prune_;
++    };
++
++    // File-scope socket registry so libdht's sendto hook (which has no session
++    // pointer) can reach the owning session's Manager. tr_udp_core registers
++    // its sockets at construction and unregisters them at destruction.
++    //
++    // Invariants (every callback runs on the session thread, so no locking):
++    //   - a registered Manager outlives the registration: tr_udp_core instances
++    //     come and go (the UDP port can change) while the Manager is a stable
++    //     tr_session member, so sockets always map to the session's live Manager;
++    //   - the only destruction-time use is ~tr_udp_core erasing entries by fd,
++    //     which never dereferences the Manager (that matters because, with the
++    //     member order in session.h, the Manager is destroyed before udp_core_);
++    //   - register_socket overwrites any stale entry left behind by a closed or
++    //     reused fd, so a missed unregister cannot point at a dead Manager.
++    void register_socket(tr_socket_t sockfd, Manager& manager);
++    void unregister_socket(tr_socket_t sockfd);
++    [[nodiscard]] Manager* find_manager(tr_socket_t sockfd) noexcept;
++} // namespace tr::proxy_protocol
+diff --git a/libtransmission/quark.cc b/libtransmission/quark.cc
+index 97b47df1e..e9810e1b3 100644
+--- a/libtransmission/quark.cc
++++ b/libtransmission/quark.cc
+@@ -426,6 +426,7 @@ auto constexpr MyStatic = std::array<std::string_view, TR_N_KEYS>{
+     "progress"sv, // .resume, rpc
+     "prompt-before-exit"sv, // qt app
+     "prompt_before_exit"sv, // qt app
++    "proxy_protocol"sv, // tr_session::Settings
+     "proxy_url"sv, // tr_session::Settings
+     "queue-move-bottom"sv, // rpc
+     "queue-move-down"sv, // rpc
+diff --git a/libtransmission/quark.h b/libtransmission/quark.h
+index 0a42044b6..780f5ab5d 100644
+--- a/libtransmission/quark.h
++++ b/libtransmission/quark.h
+@@ -439,6 +439,7 @@ enum // NOLINT(performance-enum-size)
+     TR_KEY_progress,
+     TR_KEY_prompt_before_exit_kebab_APICOMPAT,
+     TR_KEY_prompt_before_exit,
++    TR_KEY_proxy_protocol,
+     TR_KEY_proxy_url,
+     TR_KEY_queue_move_bottom_kebab_APICOMPAT,
+     TR_KEY_queue_move_down_kebab_APICOMPAT,
+diff --git a/libtransmission/rpcimpl.cc b/libtransmission/rpcimpl.cc
+index a78462a73..ac7d480a8 100644
+--- a/libtransmission/rpcimpl.cc
++++ b/libtransmission/rpcimpl.cc
+@@ -2419,6 +2419,17 @@ using SessionAccessors = std::pair<SessionGetter, SessionSetter>;
+             }
+         });
+ 
++    map.try_emplace(
++        TR_KEY_proxy_protocol,
++        [](tr_session const& src) { return src.serialize_proxy_protocol_mode(); },
++        [](tr_session& tgt, tr_variant const& src, ErrorInfo& err)
++        {
++            if (!tgt.deserialize_proxy_protocol_mode(src))
++            {
++                err = { JsonRpc::Error::INVALID_PARAMS, R"(must be one of "off", "allow" or "require")"s };
++            }
++        });
++
+     map.try_emplace(
+         TR_KEY_queue_stalled_enabled,
+         [](tr_session const& src) -> tr_variant { return src.queueStalledEnabled(); },
+diff --git a/libtransmission/serializer.cc b/libtransmission/serializer.cc
+index df73fbb44..2e2126444 100644
+--- a/libtransmission/serializer.cc
++++ b/libtransmission/serializer.cc
+@@ -152,6 +152,62 @@ tr_variant from_encryption_mode(tr_encryption_mode const& val)
+ 
+ // ---
+ 
++auto constexpr ProxyProtocolKeys = Lookup<tr_proxy_protocol_mode, 3U>{ {
++    { "off", TR_PROXY_PROTOCOL_OFF },
++    { "allow", TR_PROXY_PROTOCOL_ALLOW },
++    { "require", TR_PROXY_PROTOCOL_REQUIRE },
++} };
++
++bool to_proxy_protocol_mode(tr_variant const& src, tr_proxy_protocol_mode* tgt)
++{
++    static constexpr auto& Keys = ProxyProtocolKeys;
++
++    if (auto const val = src.value_if<std::string_view>())
++    {
++        auto const needle = tr_strlower(tr_strv_strip(*val));
++
++        for (auto const& [name, value] : Keys)
++        {
++            if (name == needle)
++            {
++                *tgt = value;
++                return true;
++            }
++        }
++    }
++
++    if (auto const val = src.value_if<int64_t>())
++    {
++        for (auto const& [name, value] : Keys)
++        {
++            if (value == *val)
++            {
++                *tgt = value;
++                return true;
++            }
++        }
++    }
++
++    return false;
++}
++
++tr_variant from_proxy_protocol_mode(tr_proxy_protocol_mode const& val)
++{
++    static constexpr auto& Keys = ProxyProtocolKeys;
++
++    for (auto const& [key, value] : Keys)
++    {
++        if (value == val)
++        {
++            return tr_variant::unmanaged_string(key);
++        }
++    }
++
++    return static_cast<int64_t>(val);
++}
++
++// ---
++
+ auto constexpr LogKeys = Lookup<tr_log_level, 7U>{ {
+     { "critical", TR_LOG_CRITICAL },
+     { "debug", TR_LOG_DEBUG },
+@@ -560,6 +616,7 @@ void Converters::ensure_default_converters()
+             Converters::add(to_port, from_port);
+             Converters::add(to_preallocation_mode, from_preallocation_mode);
+             Converters::add(to_preferred_transport, from_preferred_transport);
++            Converters::add(to_proxy_protocol_mode, from_proxy_protocol_mode);
+             Converters::add(to_size_t, from_size_t);
+             Converters::add(to_string, from_string);
+             Converters::add(to_uint64, from_uint64);
+diff --git a/libtransmission/session.cc b/libtransmission/session.cc
+index eadb60d7b..325415962 100644
+--- a/libtransmission/session.cc
++++ b/libtransmission/session.cc
+@@ -397,8 +397,18 @@ void tr_session::onIncomingPeerConnection(tr_socket_t fd, void* vsession)
+     if (auto const incoming_info = tr_netAccept(session, fd); incoming_info)
+     {
+         auto const& [socket_address, sock] = *incoming_info;
+-        tr_logAddTrace(fmt::format("new incoming connection {} ({})", sock, socket_address.display_name()));
+-        session->addIncoming({ session, socket_address, sock });
++        auto peer_address = socket_address;
++
++        // gost relays every inbound TCP connection as a PROXY protocol
++        // stream; consume the header, if any, and use the real client address
++        if (!session->proxy_protocol_.handleTcpAccepted(sock, peer_address))
++        {
++            tr_net_close_socket(sock);
++            return;
++        }
++
++        tr_logAddTrace(fmt::format("new incoming connection {} ({})", sock, peer_address.display_name()));
++        session->addIncoming({ session, peer_address, sock });
+     }
+ }
+ 
+@@ -876,6 +886,11 @@ void tr_session::setSettings(tr_session::Settings&& settings_in, bool force)
+         udp_core_ = std::make_unique<tr_session::tr_udp_core>(*this, udpPort());
+     }
+ 
++    if (auto const& val = new_settings.proxy_protocol; force || val != old_settings.proxy_protocol)
++    {
++        proxy_protocol_.setMode(val);
++    }
++
+     // Sends out announce messages with advertisedPeerPort(), so this
+     // section needs to happen here after the peer port settings changes
+     if (auto const& val = new_settings.lpd_enabled; force || val != old_settings.lpd_enabled)
+diff --git a/libtransmission/session.h b/libtransmission/session.h
+index 092cc3214..4ae2bbc7b 100644
+--- a/libtransmission/session.h
++++ b/libtransmission/session.h
+@@ -51,6 +51,7 @@
+ #include "libtransmission/open-files.h"
+ #include "libtransmission/peer-io.h" // tr_preferred_transport
+ #include "libtransmission/port-forwarding.h"
++#include "libtransmission/proxy-protocol.h"
+ #include "libtransmission/quark.h"
+ #include "libtransmission/rpc-server.h"
+ #include "libtransmission/session-alt-speeds.h"
+@@ -475,6 +476,7 @@ public:
+         std::string script_torrent_done_filename;
+         std::string script_torrent_done_seeding_filename;
+         tr_encryption_mode encryption_mode = TR_ENCRYPTION_PREFERRED;
++        tr_proxy_protocol_mode proxy_protocol = TR_PROXY_PROTOCOL_OFF;
+         tr_log_level log_level = TR_LOG_INFO;
+         tr_mode_t umask = 022;
+         tr_open_files::Preallocation preallocation_mode = tr_open_files::Preallocation::Sparse;
+@@ -520,6 +522,7 @@ public:
+             Field<&Settings::port_forwarding_enabled>{ TR_KEY_port_forwarding_enabled },
+             Field<&Settings::preallocation_mode>{ TR_KEY_preallocation },
+             Field<&Settings::preferred_transports>{ TR_KEY_preferred_transports },
++            Field<&Settings::proxy_protocol>{ TR_KEY_proxy_protocol },
+             Field<&Settings::proxy_url>{ TR_KEY_proxy_url },
+             Field<&Settings::queue_stalled_enabled>{ TR_KEY_queue_stalled_enabled },
+             Field<&Settings::queue_stalled_minutes>{ TR_KEY_queue_stalled_minutes },
+@@ -977,6 +980,18 @@ public:
+         return libtransmission::serializer::Converters::deserialize(var, &settings_.encryption_mode);
+     }
+ 
++    [[nodiscard]] auto serialize_proxy_protocol_mode() const noexcept
++    {
++        auto var = libtransmission::serializer::to_variant(settings().proxy_protocol);
++        TR_ASSERT(var.has_value());
++        return var;
++    }
++
++    bool deserialize_proxy_protocol_mode(tr_variant const& var) noexcept
++    {
++        return libtransmission::serializer::Converters::deserialize(var, &settings_.proxy_protocol);
++    }
++
+     [[nodiscard]] constexpr auto preallocationMode() const noexcept
+     {
+         return settings().preallocation_mode;
+@@ -1398,6 +1413,20 @@ public:
+     // FIXME(ckerr): circular dependency udp_core -> announcer_udp -> announcer_udp_mediator -> udp_core
+     std::unique_ptr<tr_udp_core> udp_core_;
+ 
++    // depends-on: settings_.proxy_protocol
++    //
++    // PROXY protocol state for gost-relayed connections; tr_udp_core registers
++    // its sockets against this Manager (see proxy-protocol.h).
++    //
++    // This Manager is deliberately declared after udp_core_, so it is destroyed
++    // *before* udp_core_ (members are destroyed in reverse declaration order).
++    // ~tr_udp_core therefore runs with this Manager already gone; that is safe
++    // only because the destructor just erases socket-registry entries by fd and
++    // never dereferences the Manager. No event callbacks run during member
++    // destruction, so dht_sendto cannot observe the destroyed Manager in the
++    // window between the two destructors.
++    tr::proxy_protocol::Manager proxy_protocol_;
++
+     // monitors the "global pool" speeds
+     tr_bandwidth top_bandwidth_{ true };
+ 
+diff --git a/libtransmission/tr-dht.cc b/libtransmission/tr-dht.cc
+index 200899c6e..8b9ff40bd 100644
+--- a/libtransmission/tr-dht.cc
++++ b/libtransmission/tr-dht.cc
+@@ -39,6 +39,7 @@
+ #include "libtransmission/log.h"
+ #include "libtransmission/net.h"
+ #include "libtransmission/peer-mgr.h" // for tr_peerMgrCompactToPex()
++#include "libtransmission/proxy-protocol.h"
+ #include "libtransmission/quark.h"
+ #include "libtransmission/timer.h"
+ #include "libtransmission/tr-assert.h"
+@@ -90,8 +91,27 @@ extern "C"
+ 
+     int dht_sendto(int sockfd, void const* buf, int len, int flags, struct sockaddr const* to, int tolen)
+     {
++        // gost relays DHT traffic; rewrite real client addresses back to the
++        // actual (relay) address so replies traverse the relay
++        auto storage = sockaddr_storage{};
++        auto storage_len = socklen_t{ 0 };
++        auto const* send_to = to;
++        auto send_len = tolen;
++
++        if (auto* const manager = tr::proxy_protocol::find_manager(sockfd); manager != nullptr)
++        {
++            if (auto const rewritten = manager->rewriteOutbound(to); rewritten)
++            {
++                auto const [sa, sa_len] = rewritten->to_sockaddr();
++                storage = sa;
++                storage_len = sa_len;
++                send_to = reinterpret_cast<sockaddr const*>(&storage);
++                send_len = static_cast<int>(storage_len);
++            }
++        }
++
+         // NOLINTNEXTLINE(readability-redundant-casting)
+-        return static_cast<int>(sendto(sockfd, static_cast<char const*>(buf), len, flags, to, tolen));
++        return static_cast<int>(sendto(sockfd, static_cast<char const*>(buf), len, flags, send_to, send_len));
+     }
+ 
+ #if defined(_WIN32) && !defined(__MINGW32__)
+diff --git a/libtransmission/tr-udp.cc b/libtransmission/tr-udp.cc
+index 6d35f5629..d2ee054fc 100644
+--- a/libtransmission/tr-udp.cc
++++ b/libtransmission/tr-udp.cc
+@@ -20,6 +20,7 @@
+ 
+ #include "libtransmission/log.h"
+ #include "libtransmission/net.h"
++#include "libtransmission/proxy-protocol.h"
+ #include "libtransmission/session.h"
+ #include "libtransmission/tr-assert.h"
+ #include "libtransmission/tr-utp.h"
+@@ -114,6 +115,14 @@ void event_callback(evutil_socket_t s, [[maybe_unused]] short type, void* vsessi
+             return;
+         }
+ 
++        // gost relays every UDP session as a PROXY protocol header datagram
++        // followed by payload datagrams; consume the header here and rewrite
++        // the source address of mapped payload datagrams to the real client
++        if (session->proxy_protocol_.handleUdpDatagram(std::data(buf), static_cast<size_t>(n_read), from_sa, &fromlen))
++        {
++            continue;
++        }
++
+         // Since most packets we receive here are µTP, make quick inline
+         // checks for the other protocols. The logic is as follows:
+         // - all DHT packets start with 'd' (100)
+@@ -208,6 +217,7 @@ tr_session::tr_udp_core::tr_udp_core(tr_session& session, tr_port udp_port)
+             session_.setSocketDiffServ(sock, TR_AF_INET);
+             set_socket_buffers(sock, session_.allowsUTP());
+             udp4_socket_ = sock;
++            tr::proxy_protocol::register_socket(udp4_socket_, session_.proxy_protocol_);
+             udp4_event_.reset(event_new(session_.event_base(), udp4_socket_, EV_READ | EV_PERSIST, event_callback, &session_));
+             event_add(udp4_event_.get(), nullptr);
+         }
+@@ -255,6 +265,7 @@ tr_session::tr_udp_core::tr_udp_core(tr_session& session, tr_port udp_port)
+             session_.setSocketDiffServ(sock, TR_AF_INET6);
+             set_socket_buffers(sock, session_.allowsUTP());
+             udp6_socket_ = sock;
++            tr::proxy_protocol::register_socket(udp6_socket_, session_.proxy_protocol_);
+             udp6_event_.reset(event_new(session_.event_base(), udp6_socket_, EV_READ | EV_PERSIST, event_callback, &session_));
+             event_add(udp6_event_.get(), nullptr);
+         }
+@@ -272,6 +283,7 @@ tr_session::tr_udp_core::~tr_udp_core()
+ 
+     if (is_valid_socket(udp6_socket_))
+     {
++        tr::proxy_protocol::unregister_socket(udp6_socket_);
+         tr_net_close_socket(udp6_socket_);
+         udp6_socket_ = TR_BAD_SOCKET;
+     }
+@@ -280,6 +292,7 @@ tr_session::tr_udp_core::~tr_udp_core()
+ 
+     if (is_valid_socket(udp4_socket_))
+     {
++        tr::proxy_protocol::unregister_socket(udp4_socket_);
+         tr_net_close_socket(udp4_socket_);
+         udp4_socket_ = TR_BAD_SOCKET;
+     }
+diff --git a/libtransmission/tr-utp.cc b/libtransmission/tr-utp.cc
+index 5ad253064..aba1ee483 100644
+--- a/libtransmission/tr-utp.cc
++++ b/libtransmission/tr-utp.cc
+@@ -15,6 +15,7 @@
+ #include "libtransmission/net.h"
+ #include "libtransmission/peer-io.h"
+ #include "libtransmission/peer-socket.h"
++#include "libtransmission/proxy-protocol.h"
+ #include "libtransmission/session.h"
+ #include "libtransmission/tr-assert.h"
+ #include "libtransmission/tr-utp.h"
+@@ -101,12 +102,21 @@ void utp_on_accept(tr_session* const session, UTPSocket* const utp_sock)
+ }
+ 
+ void utp_send_to(
+-    tr_session const* const ss,
++    tr_session* const ss,
+     uint8_t const* const buf,
+     size_t const buflen,
+     struct sockaddr const* const to,
+     socklen_t const tolen)
+ {
++    // gost expects replies to relayed sessions at the actual (relay) address,
++    // not at the real client address the PROXY protocol header mapped us to
++    if (auto const rewritten = ss->proxy_protocol_.rewriteOutbound(to); rewritten)
++    {
++        auto const [storage, storage_len] = rewritten->to_sockaddr();
++        ss->udp_core_->sendto(buf, buflen, reinterpret_cast<sockaddr const*>(&storage), storage_len);
++        return;
++    }
++
+     ss->udp_core_->sendto(buf, buflen, to, tolen);
+ }
+ 
+diff --git a/libtransmission/transmission.h b/libtransmission/transmission.h
+index 6a591d4ba..ea3aff97e 100644
+--- a/libtransmission/transmission.h
++++ b/libtransmission/transmission.h
+@@ -75,6 +75,23 @@ enum tr_encryption_mode : uint8_t
+     TR_ENCRYPTION_REQUIRED
+ };
+ 
++// Whether PROXY protocol headers (HAProxy) are expected on inbound peer
++// connections, for deployments where a trusted relay (gost) fronts the peer
++// port and prepends each connection/session with the real client address.
++//
++// The header is trusted unconditionally, so only ALLOW the mode on networks
++// where every host that can reach the peer port is trusted to speak for
++// itself: in ALLOW mode any direct (unrelayed) caller can claim an arbitrary
++// source address and thereby bypass IP filtering, brute-force protection and
++// DHT address reputation. REQUIRE narrows that to "only relayed peers", but
++// only if the relay itself is the sole reachable front end.
++enum tr_proxy_protocol_mode : uint8_t
++{
++    TR_PROXY_PROTOCOL_OFF, // no PROXY protocol headers are expected; nothing is parsed
++    TR_PROXY_PROTOCOL_ALLOW, // parse headers when present; accept connections without them
++    TR_PROXY_PROTOCOL_REQUIRE // parse headers; drop connections without a valid header
++};
++
+ enum tr_priority_t : int8_t
+ {
+     TR_PRI_LOW = -1,
+diff --git a/tests/libtransmission/CMakeLists.txt b/tests/libtransmission/CMakeLists.txt
+index 8da36e664..11477b86e 100644
+--- a/tests/libtransmission/CMakeLists.txt
++++ b/tests/libtransmission/CMakeLists.txt
+@@ -35,6 +35,7 @@ target_sources(libtransmission-test
+         peer-mgr-wishlist-test.cc
+         peer-msgs-test.cc
+         platform-test.cc
++        proxy-protocol-test.cc
+         quark-test.cc
+         remove-test.cc
+         rename-test.cc
+diff --git a/tests/libtransmission/proxy-protocol-test.cc b/tests/libtransmission/proxy-protocol-test.cc
+new file mode 100644
+index 000000000..c370b3716
+--- /dev/null
++++ b/tests/libtransmission/proxy-protocol-test.cc
+@@ -0,0 +1,711 @@
++// This file Copyright (C) 2026.
++// It may be used under GPLv2 (SPDX: GPL-2.0-only), GPLv3 (SPDX: GPL-3.0-only),
++// or any future license endorsed by Mnemosyne LLC.
++
++#include <array>
++#include <chrono> // std::chrono literals
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#ifdef _WIN32
++#include <winsock2.h>
++#else
++#include <fcntl.h> // fcntl(), F_SETFL, O_NONBLOCK
++#include <sys/socket.h> // socketpair()
++#include <thread> // std::thread
++#include <unistd.h> // close(), read(), write()
++#endif
++
++#include <libtransmission/net.h>
++#include <libtransmission/proxy-protocol.h>
++#include <libtransmission/quark.h>
++#include <libtransmission/session.h> // tr_session::Settings
++#include <libtransmission/variant.h>
++
++#include "test-fixtures.h"
++
++using namespace std::literals;
++
++namespace
++{
++    // Reuse the parser's own signature bytes so these tests can never drift
++    // from what parse() matches against.
++    using tr::proxy_protocol::V2Signature;
++
++    void appendPortBE(std::vector<std::byte>& out, uint16_t port)
++    {
++        out.push_back(std::byte{ static_cast<uint8_t>(port >> 8U) });
++        out.push_back(std::byte{ static_cast<uint8_t>(port & 0xFFU) });
++    }
++
++    // Build a v2 header: signature + version/command + family + length + address block.
++    std::vector<std::byte> makeV2Header(uint8_t ver_cmd, uint8_t fam, std::byte const* addr_block, size_t addr_len)
++    {
++        auto out = std::vector<std::byte>{};
++        out.reserve(16U + addr_len);
++        out.insert(std::end(out), std::begin(V2Signature), std::end(V2Signature));
++        out.push_back(std::byte{ ver_cmd });
++        out.push_back(std::byte{ fam });
++        appendPortBE(out, static_cast<uint16_t>(addr_len));
++        if (addr_len > 0U)
++        {
++            out.insert(std::end(out), addr_block, addr_block + addr_len);
++        }
++        return out;
++    }
++
++    std::vector<std::byte> makeV2Inet(
++        std::string_view src_ip,
++        uint16_t src_port,
++        std::string_view dst_ip,
++        uint16_t dst_port)
++    {
++        auto block = std::vector<std::byte>{};
++        block.reserve(12U);
++        auto const src = tr_address::from_string(src_ip);
++        auto const dst = tr_address::from_string(dst_ip);
++        auto src_addr = src.value_or(tr_address::any(TR_AF_INET));
++        auto dst_addr = dst.value_or(tr_address::any(TR_AF_INET));
++        auto out = std::back_inserter(block);
++        out = tr_socket_address::to_compact(out, src_addr, tr_port::from_host(src_port));
++        out = tr_socket_address::to_compact(out, dst_addr, tr_port::from_host(dst_port));
++        return makeV2Header(0x20, 0x11, std::data(block), std::size(block));
++    }
++
++    std::vector<std::byte> toBytes(std::string_view s)
++    {
++        auto out = std::vector<std::byte>{};
++        out.reserve(std::size(s));
++        for (auto const c : s)
++        {
++            out.push_back(std::byte{ static_cast<uint8_t>(c) });
++        }
++        return out;
++    }
++
++    std::vector<std::byte> v1Header(std::string_view src_ip, uint16_t src_port, std::string_view dst_ip, uint16_t dst_port)
++    {
++        auto line = std::string{ "PROXY TCP4 " };
++        line += src_ip;
++        line += ' ';
++        line += dst_ip;
++        line += ' ';
++        line += std::to_string(src_port);
++        line += ' ';
++        line += std::to_string(dst_port);
++        line += "\r\n";
++        return toBytes(line);
++    }
++
++#ifdef _WIN32
++    char constexpr SocketTestUnsupported = 0;
++#else
++    // Create a connected pair of non-blocking sockets.
++    void makeSocketPair(int fds[2])
++    {
++        ASSERT_EQ(0, socketpair(AF_UNIX, SOCK_STREAM, 0, fds));
++        for (auto const fd : { fds[0], fds[1] })
++        {
++            (void)fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
++        }
++    }
++#endif
++} // namespace
++
++TEST(ProxyProtocolParse, v1Tcp4)
++{
++    auto const data = v1Header("1.2.3.4", 1234, "5.6.7.8", 5678);
++
++    auto const [result, header] = tr::proxy_protocol::parse(std::data(data), std::size(data));
++    EXPECT_EQ(tr::proxy_protocol::ParseResult::Complete, result);
++    ASSERT_TRUE(header.has_value());
++    EXPECT_EQ("1.2.3.4", header->source.address().display_name());
++    EXPECT_EQ(tr_port::from_host(1234), header->source.port());
++    EXPECT_EQ(std::size(data), header->header_len);
++}
++
++TEST(ProxyProtocolParse, v1Tcp6)
++{
++    auto const data = toBytes("PROXY TCP6 2001:db8::1 2001:db8::2 1234 5678\r\n");
++
++    auto const [result, header] = tr::proxy_protocol::parse(std::data(data), std::size(data));
++    EXPECT_EQ(tr::proxy_protocol::ParseResult::Complete, result);
++    ASSERT_TRUE(header.has_value());
++    EXPECT_EQ("2001:db8::1", header->source.address().display_name());
++    EXPECT_EQ(tr_port::from_host(1234), header->source.port());
++    EXPECT_EQ(std::size(data), header->header_len);
++}
++
++TEST(ProxyProtocolParse, v1Unknown)
++{
++    auto const data = toBytes("PROXY UNKNOWN\r\n");
++
++    auto const [result, header] = tr::proxy_protocol::parse(std::data(data), std::size(data));
++    EXPECT_EQ(tr::proxy_protocol::ParseResult::Complete, result);
++    ASSERT_TRUE(header.has_value());
++    EXPECT_FALSE(header->source.is_valid());
++    EXPECT_EQ(std::size(data), header->header_len);
++}
++
++TEST(ProxyProtocolParse, v1Incomplete)
++{
++    auto const data = toBytes("PROXY TCP4 1.2.3.4 5.6.7.8 12"); // no CRLF yet
++
++    auto const [result, header] = tr::proxy_protocol::parse(std::data(data), std::size(data));
++    EXPECT_EQ(tr::proxy_protocol::ParseResult::Incomplete, result);
++    EXPECT_FALSE(header.has_value());
++}
++
++TEST(ProxyProtocolParse, v1MalformedLine)
++{
++    // "PROXY " prefix with a CRLF-terminated line that isn't a valid header
++    auto const data = toBytes("PROXY NOTAPROTOCOL\r\n");
++
++    auto const [result, header] = tr::proxy_protocol::parse(std::data(data), std::size(data));
++    EXPECT_EQ(tr::proxy_protocol::ParseResult::NotHeader, result);
++    EXPECT_FALSE(header.has_value());
++}
++
++TEST(ProxyProtocolParse, v1TooLong)
++{
++    // v1 lines must be at most 107 bytes including the CRLF
++    auto data = std::vector<std::byte>{};
++    auto line = std::string{ "PROXY TCP4 " };
++    for (size_t i = 0; i < 30; ++i) // >> 107 bytes total
++    {
++        line += "1.2.3.4 5.6.7.8 1234 5678 ";
++    }
++    line += "\r\n";
++    data = toBytes(line);
++
++    auto const [result, header] = tr::proxy_protocol::parse(std::data(data), std::size(data));
++    EXPECT_EQ(tr::proxy_protocol::ParseResult::NotHeader, result);
++    EXPECT_FALSE(header.has_value());
++}
++
++TEST(ProxyProtocolParse, v1PartialPrefix)
++{
++    auto const data = toBytes("PROX");
++
++    auto const [result, header] = tr::proxy_protocol::parse(std::data(data), std::size(data));
++    EXPECT_EQ(tr::proxy_protocol::ParseResult::Incomplete, result);
++    EXPECT_FALSE(header.has_value());
++}
++
++TEST(ProxyProtocolParse, v1TrailingPayload)
++{
++    auto header = v1Header("1.2.3.4", 1234, "5.6.7.8", 5678);
++    auto payload = toBytes("\x13"
++                           "BitTorrent protocol");
++    header.insert(std::end(header), std::begin(payload), std::end(payload));
++
++    auto const [result, parsed] = tr::proxy_protocol::parse(std::data(header), std::size(header));
++    EXPECT_EQ(tr::proxy_protocol::ParseResult::Complete, result);
++    ASSERT_TRUE(parsed.has_value());
++    EXPECT_EQ("1.2.3.4", parsed->source.address().display_name());
++    EXPECT_EQ(tr_port::from_host(1234), parsed->source.port());
++    // only the header is consumed; the payload stays
++    EXPECT_EQ(std::size(v1Header("1.2.3.4", 1234, "5.6.7.8", 5678)), parsed->header_len);
++}
++
++TEST(ProxyProtocolParse, v2Inet)
++{
++    auto const data = makeV2Inet("1.2.3.4", 1234, "5.6.7.8", 5678);
++
++    auto const [result, header] = tr::proxy_protocol::parse(std::data(data), std::size(data));
++    EXPECT_EQ(tr::proxy_protocol::ParseResult::Complete, result);
++    ASSERT_TRUE(header.has_value());
++    EXPECT_EQ("1.2.3.4", header->source.address().display_name());
++    EXPECT_EQ(tr_port::from_host(1234), header->source.port());
++    EXPECT_EQ(28U, header->header_len); // 16-byte fixed header + 12-byte addr block
++}
++
++TEST(ProxyProtocolParse, v2Inet6)
++{
++    auto block = std::vector<std::byte>{};
++    block.reserve(36U);
++    auto const src = tr_address::from_string("2001:db8::1");
++    auto const dst = tr_address::from_string("2001:db8::2");
++    auto out = std::back_inserter(block);
++    out = tr_socket_address::to_compact(out, *src, tr_port::from_host(1234));
++    out = tr_socket_address::to_compact(out, *dst, tr_port::from_host(5678));
++    auto const data6 = makeV2Header(0x20, 0x21, std::data(block), std::size(block));
++
++    auto const [result, header] = tr::proxy_protocol::parse(std::data(data6), std::size(data6));
++    EXPECT_EQ(tr::proxy_protocol::ParseResult::Complete, result);
++    ASSERT_TRUE(header.has_value());
++    EXPECT_EQ("2001:db8::1", header->source.address().display_name());
++    EXPECT_EQ(tr_port::from_host(1234), header->source.port());
++    EXPECT_EQ(52U, header->header_len); // 16-byte fixed header + 36-byte addr block
++}
++
++TEST(ProxyProtocolParse, v2Local)
++{
++    // LOCAL command (0x21): carries no address info
++    auto const data = makeV2Header(0x21, 0x00, nullptr, 0);
++
++    auto const [result, header] = tr::proxy_protocol::parse(std::data(data), std::size(data));
++    EXPECT_EQ(tr::proxy_protocol::ParseResult::Complete, result);
++    ASSERT_TRUE(header.has_value());
++    EXPECT_FALSE(header->source.is_valid());
++    EXPECT_EQ(16U, header->header_len);
++}
++
++TEST(ProxyProtocolParse, v2Unspec)
++{
++    // PROXY command with UNSPEC family (0x00): TLVs only, no address
++    auto const data = makeV2Header(0x20, 0x00, nullptr, 0);
++
++    auto const [result, header] = tr::proxy_protocol::parse(std::data(data), std::size(data));
++    EXPECT_EQ(tr::proxy_protocol::ParseResult::Complete, result);
++    ASSERT_TRUE(header.has_value());
++    EXPECT_FALSE(header->source.is_valid());
++    EXPECT_EQ(16U, header->header_len);
++}
++
++TEST(ProxyProtocolParse, v2Incomplete)
++{
++    // signature + partial fixed header
++    auto data = toBytes("\r\n\r\n\x00\r\nQUIT\n\x20\x11\x00");
++    auto const [result, header] = tr::proxy_protocol::parse(std::data(data), std::size(data));
++    EXPECT_EQ(tr::proxy_protocol::ParseResult::Incomplete, result);
++    EXPECT_FALSE(header.has_value());
++
++    // claims a 12-byte address block but only provides a few bytes
++    auto data2 = makeV2Inet("1.2.3.4", 1234, "5.6.7.8", 5678);
++    data2.resize(20U);
++    auto const [result2, header2] = tr::proxy_protocol::parse(std::data(data2), std::size(data2));
++    EXPECT_EQ(tr::proxy_protocol::ParseResult::Incomplete, result2);
++    EXPECT_FALSE(header2.has_value());
++}
++
++TEST(ProxyProtocolParse, v2TrailingPayload)
++{
++    auto data = makeV2Inet("1.2.3.4", 1234, "5.6.7.8", 5678);
++    auto payload = toBytes("\x13"
++                           "BitTorrent protocol");
++    data.insert(std::end(data), std::begin(payload), std::end(payload));
++
++    auto const [result, header] = tr::proxy_protocol::parse(std::data(data), std::size(data));
++    EXPECT_EQ(tr::proxy_protocol::ParseResult::Complete, result);
++    ASSERT_TRUE(header.has_value());
++    EXPECT_EQ(28U, header->header_len);
++}
++
++TEST(ProxyProtocolParse, notAHeader)
++{
++    auto const data = toBytes("\x13"
++                              "BitTorrent protocol");
++    auto const [result, header] = tr::proxy_protocol::parse(std::data(data), std::size(data));
++    EXPECT_EQ(tr::proxy_protocol::ParseResult::NotHeader, result);
++    EXPECT_FALSE(header.has_value());
++}
++
++TEST(ProxyProtocolManager, offModeIsNoop)
++{
++    auto manager = tr::proxy_protocol::Manager{}; // default: TR_PROXY_PROTOCOL_OFF
++    auto addr = tr_socket_address{ tr_address::from_string("1.2.3.4").value(), tr_port::from_host(1234) };
++
++    // even a plausible header datagram must not be consumed in off mode
++    auto header = makeV2Inet("1.2.3.4", 1234, "5.6.7.8", 5678);
++    auto from = sockaddr_storage{};
++    auto fromlen = socklen_t{ sizeof(from) };
++    EXPECT_FALSE(manager.handleUdpDatagram(std::data(header), std::size(header), reinterpret_cast<sockaddr*>(&from), &fromlen));
++
++    auto const addr_ss = tr_socket_address::to_sockaddr(addr).first;
++    EXPECT_FALSE(manager.rewriteOutbound(reinterpret_cast<sockaddr const*>(&addr_ss)));
++}
++
++TEST(ProxyProtocolManager, udpHeaderRecordsMappingAndRewrites)
++{
++    auto manager = tr::proxy_protocol::Manager{ TR_PROXY_PROTOCOL_ALLOW };
++
++    // inbound header datagram from the gost relay (127.0.0.1:5555) claims client 1.2.3.4:1234
++    auto header = makeV2Inet("1.2.3.4", 1234, "5.6.7.8", 5678);
++    auto from = sockaddr_storage{};
++    auto fromlen = socklen_t{ sizeof(from) };
++    auto* const from_sa = reinterpret_cast<sockaddr*>(&from);
++    auto const actual = tr_socket_address{ tr_address::from_string("127.0.0.1").value(), tr_port::from_host(5555) };
++    auto [actual_ss, actual_len] = tr_socket_address::to_sockaddr(actual);
++    std::memcpy(from_sa, &actual_ss, sizeof(actual_ss));
++    fromlen = actual_len;
++
++    EXPECT_TRUE(manager.handleUdpDatagram(std::data(header), std::size(header), from_sa, &fromlen));
++
++    // outbound rewrite: a reply to the real client must go back through the relay
++    auto reply_to = tr_socket_address{ tr_address::from_string("1.2.3.4").value(), tr_port::from_host(1234) };
++    auto const reply_to_ss = tr_socket_address::to_sockaddr(reply_to).first;
++    auto const rewritten_out = manager.rewriteOutbound(reinterpret_cast<sockaddr const*>(&reply_to_ss));
++    ASSERT_TRUE(rewritten_out.has_value());
++    EXPECT_EQ(actual, *rewritten_out);
++
++    // inbound rewrite: a payload datagram from the relay is attributed to the real client
++    auto payload = toBytes("d1:ad2:id20:01234567890123456789e");
++    from = sockaddr_storage{};
++    std::memcpy(from_sa, &actual_ss, sizeof(actual_ss));
++    fromlen = actual_len;
++    EXPECT_FALSE(manager.handleUdpDatagram(std::data(payload), std::size(payload), from_sa, &fromlen));
++    auto const rewritten = tr_socket_address::from_sockaddr(from_sa);
++    ASSERT_TRUE(rewritten.has_value());
++    EXPECT_EQ("1.2.3.4", rewritten->address().display_name());
++    EXPECT_EQ(tr_port::from_host(1234), rewritten->port());
++}
++
++TEST(ProxyProtocolManager, socketRegistry)
++{
++    auto manager = tr::proxy_protocol::Manager{};
++    auto const fake_sockfd = tr_socket_t{ 12345 };
++
++    EXPECT_EQ(nullptr, tr::proxy_protocol::find_manager(fake_sockfd));
++    tr::proxy_protocol::register_socket(fake_sockfd, manager);
++    EXPECT_EQ(&manager, tr::proxy_protocol::find_manager(fake_sockfd));
++    tr::proxy_protocol::unregister_socket(fake_sockfd);
++    EXPECT_EQ(nullptr, tr::proxy_protocol::find_manager(fake_sockfd));
++}
++
++namespace tr::test
++{
++    // Friend of tr::proxy_protocol::Manager, so the helpers below can drive the
++    // UDP session mapping and clock directly instead of sleeping 15 minutes.
++    // Private access must stay in this class: gtest's TEST_F bodies run in a
++    // *derived* class, and friendship is not inherited.
++    class ProxyProtocolTest : public ::testing::Test
++    {
++    protected:
++        tr::proxy_protocol::Manager manager_{ TR_PROXY_PROTOCOL_ALLOW };
++
++        static tr_socket_address addr(std::string_view host, uint16_t port)
++        {
++            return tr_socket_address{ tr_address::from_string(host).value(), tr_port::from_host(port) };
++        }
++
++        static sockaddr_storage sockaddr_of(tr_socket_address const& a)
++        {
++            return tr_socket_address::to_sockaddr(a).first;
++        }
++
++        static sockaddr* as_sockaddr(sockaddr_storage& storage)
++        {
++            return reinterpret_cast<sockaddr*>(&storage);
++        }
++
++        static sockaddr const* as_sockaddr(sockaddr_storage const& storage)
++        {
++            return reinterpret_cast<sockaddr const*>(&storage);
++        }
++
++        // Dispatch a payload datagram supposedly sent by `from`; returns whether
++        // handleUdpDatagram consumed it (false = it was dispatched normally) and
++        // rewrites `from` in place when the source address is mapped.
++        bool send_payload_from(tr_socket_address const& from, sockaddr_storage& from_out)
++        {
++            auto payload = toBytes("d1:ad2:id20:01234567890123456789e");
++            from_out = sockaddr_of(from);
++            auto fromlen = socklen_t{ sizeof(from_out) };
++            return manager_.handleUdpDatagram(std::data(payload), std::size(payload), as_sockaddr(from_out), &fromlen);
++        }
++
++        void record(tr_socket_address const& real, tr_socket_address const& actual)
++        {
++            manager_.record(real, actual);
++        }
++
++        // Mark the session for `real` as idle past the 15-minute cutoff.
++        void expire_session(tr_socket_address const& real)
++        {
++            manager_.sessions_.at(real).last_seen -= std::chrono::minutes{ 16 };
++        }
++
++        void prune()
++        {
++            manager_.prune(std::chrono::steady_clock::now());
++        }
++
++        [[nodiscard]] size_t session_count() const
++        {
++            return manager_.sessions_.size();
++        }
++
++        [[nodiscard]] size_t reverse_index_count() const
++        {
++            return manager_.actual_to_real_.size();
++        }
++    };
++
++    TEST_F(ProxyProtocolTest, rebindRealCleansStaleReverseIndex)
++    {
++        auto const real = addr("1.2.3.4", 1234);
++        auto const actual1 = addr("127.0.0.1", 5555);
++        auto const actual2 = addr("127.0.0.1", 6666);
++
++        record(real, actual1);
++        record(real, actual2); // the gost session (source port) changed
++
++        // the stale reverse entry for actual1 is gone: a payload datagram from
++        // actual1 must no longer be attributed to `real`
++        auto from = sockaddr_storage{};
++        EXPECT_FALSE(this->send_payload_from(actual1, from));
++        EXPECT_EQ(actual1, *tr_socket_address::from_sockaddr(as_sockaddr(from)));
++
++        // actual2 still rewrites to the real client
++        EXPECT_FALSE(this->send_payload_from(actual2, from));
++        EXPECT_EQ(real, *tr_socket_address::from_sockaddr(as_sockaddr(from)));
++
++        // outbound replies to the real client still go back through actual2
++        auto const to = sockaddr_of(real);
++        auto const rewritten = manager_.rewriteOutbound(as_sockaddr(to));
++        ASSERT_TRUE(rewritten.has_value());
++        EXPECT_EQ(actual2, *rewritten);
++
++        // both indices hold exactly one session
++        EXPECT_EQ(1U, session_count());
++        EXPECT_EQ(1U, reverse_index_count());
++    }
++
++    TEST_F(ProxyProtocolTest, rebindActualDropsOldForwardEntry)
++    {
++        auto const real1 = addr("1.2.3.4", 1234);
++        auto const real2 = addr("5.6.7.8", 5678);
++        auto const actual = addr("127.0.0.1", 5555);
++
++        record(real1, actual);
++        record(real2, actual); // the relay session now belongs to real2
++
++        // real1's session is gone: outbound replies to it are sent as-is
++        auto const to1 = sockaddr_of(real1);
++        EXPECT_FALSE(manager_.rewriteOutbound(as_sockaddr(to1)).has_value());
++
++        // real2 maps to the relay, and inbound traffic is attributed to real2
++        auto const to2 = sockaddr_of(real2);
++        auto const rewritten = manager_.rewriteOutbound(as_sockaddr(to2));
++        ASSERT_TRUE(rewritten.has_value());
++        EXPECT_EQ(actual, *rewritten);
++
++        auto from = sockaddr_storage{};
++        EXPECT_FALSE(this->send_payload_from(actual, from));
++        EXPECT_EQ(real2, *tr_socket_address::from_sockaddr(as_sockaddr(from)));
++
++        EXPECT_EQ(1U, session_count());
++        EXPECT_EQ(1U, reverse_index_count());
++    }
++
++    TEST_F(ProxyProtocolTest, pruneRemovesIdleSessionsFromBothIndices)
++    {
++        auto const real1 = addr("1.2.3.4", 1234);
++        auto const actual1 = addr("127.0.0.1", 5555);
++        auto const real2 = addr("5.6.7.8", 5678);
++        auto const actual2 = addr("127.0.0.1", 6666);
++
++        record(real1, actual1);
++        record(real2, actual2);
++
++        // real1's session has been idle past the 15-minute cutoff
++        expire_session(real1);
++        prune();
++
++        auto const to1 = sockaddr_of(real1);
++        EXPECT_FALSE(manager_.rewriteOutbound(as_sockaddr(to1)).has_value());
++
++        auto const to2 = sockaddr_of(real2);
++        auto const rewritten = manager_.rewriteOutbound(as_sockaddr(to2));
++        ASSERT_TRUE(rewritten.has_value());
++        EXPECT_EQ(actual2, *rewritten);
++
++        EXPECT_EQ(1U, session_count());
++        EXPECT_EQ(1U, reverse_index_count());
++    }
++} // namespace tr::test
++
++#ifdef _WIN32
++TEST(ProxyProtocolManager, DISABLED_tcpAcceptedConsumesHeader) {}
++TEST(ProxyProtocolManager, DISABLED_requireTcpNoHeader) {}
++TEST(ProxyProtocolManager, DISABLED_allowTcpNoHeader) {}
++#else
++TEST(ProxyProtocolManager, tcpAcceptedConsumesHeader)
++{
++    auto fds = std::array<int, 2>{};
++    makeSocketPair(std::data(fds));
++
++    auto header = v1Header("1.2.3.4", 1234, "5.6.7.8", 5678);
++    auto payload = toBytes("\x13"
++                           "BitTorrent protocol");
++    header.insert(std::end(header), std::begin(payload), std::end(payload));
++    (void)write(fds[1], std::data(header), std::size(header));
++
++    auto manager = tr::proxy_protocol::Manager{ TR_PROXY_PROTOCOL_REQUIRE };
++    auto peer_addr = tr_socket_address{ tr_address::from_string("172.16.0.9").value(), tr_port::from_host(7) };
++    EXPECT_TRUE(manager.handleTcpAccepted(fds[0], peer_addr));
++    EXPECT_EQ("1.2.3.4", peer_addr.address().display_name());
++    EXPECT_EQ(tr_port::from_host(1234), peer_addr.port());
++
++    // the payload is still in the stream; the header is gone
++    auto rest = std::vector<std::byte>(payload.size(), std::byte{ 0 });
++    auto const n_read = read(fds[0], std::data(rest), std::size(rest));
++    EXPECT_EQ(std::size(payload), static_cast<size_t>(n_read));
++    EXPECT_EQ(payload, rest);
++
++    (void)close(fds[0]);
++    (void)close(fds[1]);
++}
++
++TEST(ProxyProtocolManager, requireTcpNoHeader)
++{
++    auto fds = std::array<int, 2>{};
++    makeSocketPair(std::data(fds));
++
++    auto payload = toBytes("\x13"
++                           "BitTorrent protocol");
++    (void)write(fds[1], std::data(payload), std::size(payload));
++
++    auto manager = tr::proxy_protocol::Manager{ TR_PROXY_PROTOCOL_REQUIRE };
++    auto peer_addr = tr_socket_address{ tr_address::from_string("172.16.0.9").value(), tr_port::from_host(7) };
++    EXPECT_FALSE(manager.handleTcpAccepted(fds[0], peer_addr));
++
++    (void)close(fds[0]);
++    (void)close(fds[1]);
++}
++
++TEST(ProxyProtocolManager, allowTcpNoHeader)
++{
++    auto fds = std::array<int, 2>{};
++    makeSocketPair(std::data(fds));
++
++    auto payload = toBytes("\x13"
++                           "BitTorrent protocol");
++    (void)write(fds[1], std::data(payload), std::size(payload));
++
++    auto manager = tr::proxy_protocol::Manager{ TR_PROXY_PROTOCOL_ALLOW };
++    auto peer_addr = tr_socket_address{ tr_address::from_string("172.16.0.9").value(), tr_port::from_host(7) };
++    EXPECT_TRUE(manager.handleTcpAccepted(fds[0], peer_addr));
++    EXPECT_EQ("172.16.0.9", peer_addr.address().display_name());
++    EXPECT_EQ(tr_port::from_host(7), peer_addr.port());
++
++    (void)close(fds[0]);
++    (void)close(fds[1]);
++}
++
++TEST(ProxyProtocolManager, requireTcpWaitsForSplitHeader)
++{
++    auto fds = std::array<int, 2>{};
++    makeSocketPair(std::data(fds));
++
++    // the v1 header arrives in two segments: "PROXY TCP4 1.2.3.4 5.6.7.8 12"
++    // followed shortly by "34 5678\r\n"
++    auto const first = toBytes("PROXY TCP4 1.2.3.4 5.6.7.8 12");
++    auto const second = toBytes("34 5678\r\n");
++    (void)write(fds[1], std::data(first), std::size(first));
++
++    auto manager = tr::proxy_protocol::Manager{ TR_PROXY_PROTOCOL_REQUIRE };
++    auto peer_addr = tr_socket_address{ tr_address::from_string("172.16.0.9").value(), tr_port::from_host(7) };
++
++    // the rest of the header arrives while handleTcpAccepted is waiting for it
++    auto writer = std::thread([&]() {
++        std::this_thread::sleep_for(std::chrono::milliseconds{ 30 });
++        (void)write(fds[1], std::data(second), std::size(second));
++    });
++    EXPECT_TRUE(manager.handleTcpAccepted(fds[0], peer_addr));
++    writer.join();
++
++    EXPECT_EQ("1.2.3.4", peer_addr.address().display_name());
++    EXPECT_EQ(tr_port::from_host(1234), peer_addr.port());
++
++    (void)close(fds[0]);
++    (void)close(fds[1]);
++}
++
++TEST(ProxyProtocolManager, requireTcpWaitsForDelayedHeader)
++{
++    auto fds = std::array<int, 2>{};
++    makeSocketPair(std::data(fds));
++
++    auto manager = tr::proxy_protocol::Manager{ TR_PROXY_PROTOCOL_REQUIRE };
++    auto peer_addr = tr_socket_address{ tr_address::from_string("172.16.0.9").value(), tr_port::from_host(7) };
++
++    // no data is buffered yet when accept() fires (the accept-vs-write race);
++    // the header arrives while handleTcpAccepted waits for it
++    auto header = v1Header("1.2.3.4", 1234, "5.6.7.8", 5678);
++    auto writer = std::thread([&]() {
++        std::this_thread::sleep_for(std::chrono::milliseconds{ 30 });
++        (void)write(fds[1], std::data(header), std::size(header));
++    });
++    EXPECT_TRUE(manager.handleTcpAccepted(fds[0], peer_addr));
++    writer.join();
++
++    EXPECT_EQ("1.2.3.4", peer_addr.address().display_name());
++    EXPECT_EQ(tr_port::from_host(1234), peer_addr.port());
++
++    (void)close(fds[0]);
++    (void)close(fds[1]);
++}
++
++TEST(ProxyProtocolManager, requireTcpNoDataIsDropped)
++{
++    auto fds = std::array<int, 2>{};
++    makeSocketPair(std::data(fds));
++
++    auto manager = tr::proxy_protocol::Manager{ TR_PROXY_PROTOCOL_REQUIRE };
++    auto peer_addr = tr_socket_address{ tr_address::from_string("172.16.0.9").value(), tr_port::from_host(7) };
++    EXPECT_FALSE(manager.handleTcpAccepted(fds[0], peer_addr));
++
++    (void)close(fds[0]);
++    (void)close(fds[1]);
++}
++
++TEST(ProxyProtocolManager, allowTcpPartialHeaderIsNotAcceptedCorrupted)
++{
++    auto fds = std::array<int, 2>{};
++    makeSocketPair(std::data(fds));
++
++    // a header prefix that never completes must not be accepted as a plain
++    // connection: its first bytes could not be stripped from the stream
++    auto const prefix = toBytes("PROXY TCP4 1.2.3.4 ");
++    (void)write(fds[1], std::data(prefix), std::size(prefix));
++
++    auto manager = tr::proxy_protocol::Manager{ TR_PROXY_PROTOCOL_ALLOW };
++    auto peer_addr = tr_socket_address{ tr_address::from_string("172.16.0.9").value(), tr_port::from_host(7) };
++    EXPECT_FALSE(manager.handleTcpAccepted(fds[0], peer_addr));
++
++    (void)close(fds[0]);
++    (void)close(fds[1]);
++}
++#endif
++
++TEST(SettingsProxyProtocol, canLoadMode)
++{
++    static auto constexpr Key = TR_KEY_proxy_protocol;
++    static auto constexpr ExpectedValue = TR_PROXY_PROTOCOL_REQUIRE;
++
++    auto settings = std::make_unique<tr_session::Settings>();
++    ASSERT_NE(ExpectedValue, settings->proxy_protocol);
++
++    auto map = tr_variant::Map{ 1U };
++    map.try_emplace(Key, ExpectedValue);
++    settings->load(tr_variant{ std::move(map) });
++    EXPECT_EQ(ExpectedValue, settings->proxy_protocol);
++
++    settings = std::make_unique<tr_session::Settings>();
++    map = tr_variant::Map{ 1U };
++    map.try_emplace(Key, "require"sv);
++    settings->load(tr_variant{ std::move(map) });
++    EXPECT_EQ(ExpectedValue, settings->proxy_protocol);
++}
++
++TEST(SettingsProxyProtocol, canSaveMode)
++{
++    static auto constexpr Key = TR_KEY_proxy_protocol;
++    static auto constexpr SourceValue = TR_PROXY_PROTOCOL_REQUIRE;
++    static auto constexpr ExpectedValue = "require"sv;
++
++    auto settings = tr_session::Settings{};
++    EXPECT_NE(SourceValue, settings.proxy_protocol);
++    settings.proxy_protocol = SourceValue;
++
++    auto const map = settings.save();
++    auto const val = map.value_if<std::string_view>(Key);
++    ASSERT_TRUE(val);
++    EXPECT_EQ(ExpectedValue, *val);
++}

@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1
+# 多架构 headless 构建：amd64/arm64/armv7 由 buildx+QEMU 支持；glibc 2.35 基线
+# 依赖清单按官方 Building-Transmission.md（Debian 12 节，最接近 Ubuntu 22.04）对齐：
+#   基本依赖 = build-essential cmake libcurl4-openssl-dev libssl-dev
+#   可选依赖 = libb64-dev libdeflate-dev libevent-dev libminiupnpc-dev libnatpmp-dev libpsl-dev libsystemd-dev
+#              （官方注明除 libsystemd-dev 外均可缺装，Transmission 自带回退；我们按官方清单装齐走系统库）
+#   ninja/pkconfig/ca-certificates 对齐上游 CI install-deps 动作
+FROM ubuntu:22.04 AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake ninja-build pkg-config ca-certificates \
+        libssl-dev libcurl4-openssl-dev libb64-dev libdeflate-dev \
+        libevent-dev libminiupnpc-dev libnatpmp-dev libpsl-dev libsystemd-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . /src/
+RUN cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DENABLE_GTK=OFF -DENABLE_QT=OFF -DENABLE_MAC=OFF \
+        -DENABLE_NLS=OFF -DENABLE_TESTS=OFF \
+        -DENABLE_DAEMON=ON -DENABLE_CLI=ON -DENABLE_UTILS=ON \
+    && cmake --build build --target \
+        transmission-daemon transmission-cli transmission-remote \
+        transmission-create transmission-show transmission-edit
+
+FROM scratch AS export
+COPY --from=builder /src/build/daemon/transmission-daemon /out/
+COPY --from=builder /src/build/cli/transmission-cli /out/
+COPY --from=builder /src/build/utils/transmission-remote /out/
+COPY --from=builder /src/build/utils/transmission-create /out/
+COPY --from=builder /src/build/utils/transmission-show /out/
+COPY --from=builder /src/build/utils/transmission-edit /out/

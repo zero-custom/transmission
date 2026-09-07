@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1
+# musl 变体：对应上游 CI alpine-musl job（alpine:latest 容器内原生构建，clang 编译器）
+# musl 1.2.x；amd64/arm64/armv7 由 buildx+QEMU 支持
+# pin 3.24: fast_float 的 apk 包仅 3.22+ 提供（3.21 无）；clang 22.1.3 本地验证通过
+FROM alpine:3.24 AS builder
+RUN apk add --no-cache \
+        binutils build-base ca-certificates clang cmake \
+        curl-dev fast_float fmt-dev gettext-dev \
+        libdeflate-dev libdeflate-static libevent-dev \
+        libnatpmp-dev libpsl-dev linux-headers \
+        miniupnpc-dev ninja pkgconfig utfcpp
+WORKDIR /src
+COPY . /src/
+RUN cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+        -DENABLE_GTK=OFF -DENABLE_QT=OFF -DENABLE_MAC=OFF \
+        -DENABLE_NLS=OFF -DENABLE_TESTS=OFF \
+        -DENABLE_DAEMON=ON -DENABLE_CLI=ON -DENABLE_UTILS=ON \
+        -DUSE_SYSTEM_DEFAULT=ON \
+        -DUSE_SYSTEM_B64=OFF -DUSE_SYSTEM_DHT=OFF \
+        -DUSE_SYSTEM_SIGSLOT=OFF -DUSE_SYSTEM_SMALL=OFF \
+        -DUSE_SYSTEM_UTP=OFF -DUSE_SYSTEM_WIDE_INTEGER=OFF \
+    && cmake --build build --target \
+        transmission-daemon transmission-cli transmission-remote \
+        transmission-create transmission-show transmission-edit
+
+FROM scratch AS export
+COPY --from=builder /src/build/daemon/transmission-daemon /out/
+COPY --from=builder /src/build/cli/transmission-cli /out/
+COPY --from=builder /src/build/utils/transmission-remote /out/
+COPY --from=builder /src/build/utils/transmission-create /out/
+COPY --from=builder /src/build/utils/transmission-show /out/
+COPY --from=builder /src/build/utils/transmission-edit /out/
