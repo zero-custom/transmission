@@ -397,8 +397,18 @@ void tr_session::onIncomingPeerConnection(tr_socket_t fd, void* vsession)
     if (auto const incoming_info = tr_netAccept(session, fd); incoming_info)
     {
         auto const& [socket_address, sock] = *incoming_info;
-        tr_logAddTrace(fmt::format("new incoming connection {} ({})", sock, socket_address.display_name()));
-        session->addIncoming({ session, socket_address, sock });
+        auto peer_address = socket_address;
+
+        // gost relays every inbound TCP connection as a PROXY protocol
+        // stream; consume the header, if any, and use the real client address
+        if (!session->proxy_protocol_.handleTcpAccepted(sock, peer_address))
+        {
+            tr_net_close_socket(sock);
+            return;
+        }
+
+        tr_logAddTrace(fmt::format("new incoming connection {} ({})", sock, peer_address.display_name()));
+        session->addIncoming({ session, peer_address, sock });
     }
 }
 
@@ -874,6 +884,11 @@ void tr_session::setSettings(tr_session::Settings&& settings_in, bool force)
     if (!udp_core_ || force || addr_changed || port_changed || utp_changed)
     {
         udp_core_ = std::make_unique<tr_session::tr_udp_core>(*this, udpPort());
+    }
+
+    if (auto const& val = new_settings.proxy_protocol; force || val != old_settings.proxy_protocol)
+    {
+        proxy_protocol_.setMode(val);
     }
 
     // Sends out announce messages with advertisedPeerPort(), so this

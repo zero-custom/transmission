@@ -439,6 +439,7 @@ enum // NOLINT(performance-enum-size)
     TR_KEY_progress,
     TR_KEY_prompt_before_exit_kebab_APICOMPAT,
     TR_KEY_prompt_before_exit,
+    TR_KEY_proxy_protocol,
     TR_KEY_proxy_url,
     TR_KEY_queue_move_bottom_kebab_APICOMPAT,
     TR_KEY_queue_move_down_kebab_APICOMPAT,

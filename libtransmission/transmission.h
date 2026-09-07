@@ -75,6 +75,23 @@ enum tr_encryption_mode : uint8_t
     TR_ENCRYPTION_REQUIRED
 };
 
+// Whether PROXY protocol headers (HAProxy) are expected on inbound peer
+// connections, for deployments where a trusted relay (gost) fronts the peer
+// port and prepends each connection/session with the real client address.
+//
+// The header is trusted unconditionally, so only ALLOW the mode on networks
+// where every host that can reach the peer port is trusted to speak for
+// itself: in ALLOW mode any direct (unrelayed) caller can claim an arbitrary
+// source address and thereby bypass IP filtering, brute-force protection and
+// DHT address reputation. REQUIRE narrows that to "only relayed peers", but
+// only if the relay itself is the sole reachable front end.
+enum tr_proxy_protocol_mode : uint8_t
+{
+    TR_PROXY_PROTOCOL_OFF, // no PROXY protocol headers are expected; nothing is parsed
+    TR_PROXY_PROTOCOL_ALLOW, // parse headers when present; accept connections without them
+    TR_PROXY_PROTOCOL_REQUIRE // parse headers; drop connections without a valid header
+};
+
 enum tr_priority_t : int8_t
 {
     TR_PRI_LOW = -1,

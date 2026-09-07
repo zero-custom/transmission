@@ -35,6 +35,7 @@ target_sources(libtransmission-test
         peer-mgr-wishlist-test.cc
         peer-msgs-test.cc
         platform-test.cc
+        proxy-protocol-test.cc
         quark-test.cc
         remove-test.cc
         rename-test.cc

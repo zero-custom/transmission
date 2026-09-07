@@ -20,6 +20,7 @@
 
 #include "libtransmission/log.h"
 #include "libtransmission/net.h"
+#include "libtransmission/proxy-protocol.h"
 #include "libtransmission/session.h"
 #include "libtransmission/tr-assert.h"
 #include "libtransmission/tr-utp.h"
@@ -112,6 +113,14 @@ void event_callback(evutil_socket_t s, [[maybe_unused]] short type, void* vsessi
                 tr_utp_issue_deferred_acks(session);
             }
             return;
+        }
+
+        // gost relays every UDP session as a PROXY protocol header datagram
+        // followed by payload datagrams; consume the header here and rewrite
+        // the source address of mapped payload datagrams to the real client
+        if (session->proxy_protocol_.handleUdpDatagram(std::data(buf), static_cast<size_t>(n_read), from_sa, &fromlen))
+        {
+            continue;
         }
 
         // Since most packets we receive here are µTP, make quick inline
@@ -208,6 +217,7 @@ tr_session::tr_udp_core::tr_udp_core(tr_session& session, tr_port udp_port)
             session_.setSocketDiffServ(sock, TR_AF_INET);
             set_socket_buffers(sock, session_.allowsUTP());
             udp4_socket_ = sock;
+            tr::proxy_protocol::register_socket(udp4_socket_, session_.proxy_protocol_);
             udp4_event_.reset(event_new(session_.event_base(), udp4_socket_, EV_READ | EV_PERSIST, event_callback, &session_));
             event_add(udp4_event_.get(), nullptr);
         }
@@ -255,6 +265,7 @@ tr_session::tr_udp_core::tr_udp_core(tr_session& session, tr_port udp_port)
             session_.setSocketDiffServ(sock, TR_AF_INET6);
             set_socket_buffers(sock, session_.allowsUTP());
             udp6_socket_ = sock;
+            tr::proxy_protocol::register_socket(udp6_socket_, session_.proxy_protocol_);
             udp6_event_.reset(event_new(session_.event_base(), udp6_socket_, EV_READ | EV_PERSIST, event_callback, &session_));
             event_add(udp6_event_.get(), nullptr);
         }
@@ -272,6 +283,7 @@ tr_session::tr_udp_core::~tr_udp_core()
 
     if (is_valid_socket(udp6_socket_))
     {
+        tr::proxy_protocol::unregister_socket(udp6_socket_);
         tr_net_close_socket(udp6_socket_);
         udp6_socket_ = TR_BAD_SOCKET;
     }
@@ -280,6 +292,7 @@ tr_session::tr_udp_core::~tr_udp_core()
 
     if (is_valid_socket(udp4_socket_))
     {
+        tr::proxy_protocol::unregister_socket(udp4_socket_);
         tr_net_close_socket(udp4_socket_);
         udp4_socket_ = TR_BAD_SOCKET;
     }

@@ -51,6 +51,7 @@
 #include "libtransmission/open-files.h"
 #include "libtransmission/peer-io.h" // tr_preferred_transport
 #include "libtransmission/port-forwarding.h"
+#include "libtransmission/proxy-protocol.h"
 #include "libtransmission/quark.h"
 #include "libtransmission/rpc-server.h"
 #include "libtransmission/session-alt-speeds.h"
@@ -475,6 +476,7 @@ public:
         std::string script_torrent_done_filename;
         std::string script_torrent_done_seeding_filename;
         tr_encryption_mode encryption_mode = TR_ENCRYPTION_PREFERRED;
+        tr_proxy_protocol_mode proxy_protocol = TR_PROXY_PROTOCOL_OFF;
         tr_log_level log_level = TR_LOG_INFO;
         tr_mode_t umask = 022;
         tr_open_files::Preallocation preallocation_mode = tr_open_files::Preallocation::Sparse;
@@ -520,6 +522,7 @@ public:
             Field<&Settings::port_forwarding_enabled>{ TR_KEY_port_forwarding_enabled },
             Field<&Settings::preallocation_mode>{ TR_KEY_preallocation },
             Field<&Settings::preferred_transports>{ TR_KEY_preferred_transports },
+            Field<&Settings::proxy_protocol>{ TR_KEY_proxy_protocol },
             Field<&Settings::proxy_url>{ TR_KEY_proxy_url },
             Field<&Settings::queue_stalled_enabled>{ TR_KEY_queue_stalled_enabled },
             Field<&Settings::queue_stalled_minutes>{ TR_KEY_queue_stalled_minutes },
@@ -977,6 +980,18 @@ public:
         return libtransmission::serializer::Converters::deserialize(var, &settings_.encryption_mode);
     }
 
+    [[nodiscard]] auto serialize_proxy_protocol_mode() const noexcept
+    {
+        auto var = libtransmission::serializer::to_variant(settings().proxy_protocol);
+        TR_ASSERT(var.has_value());
+        return var;
+    }
+
+    bool deserialize_proxy_protocol_mode(tr_variant const& var) noexcept
+    {
+        return libtransmission::serializer::Converters::deserialize(var, &settings_.proxy_protocol);
+    }
+
     [[nodiscard]] constexpr auto preallocationMode() const noexcept
     {
         return settings().preallocation_mode;
@@ -1397,6 +1412,20 @@ public:
     // depends-on: settings_, announcer_udp_, global_ip_cache_
     // FIXME(ckerr): circular dependency udp_core -> announcer_udp -> announcer_udp_mediator -> udp_core
     std::unique_ptr<tr_udp_core> udp_core_;
+
+    // depends-on: settings_.proxy_protocol
+    //
+    // PROXY protocol state for gost-relayed connections; tr_udp_core registers
+    // its sockets against this Manager (see proxy-protocol.h).
+    //
+    // This Manager is deliberately declared after udp_core_, so it is destroyed
+    // *before* udp_core_ (members are destroyed in reverse declaration order).
+    // ~tr_udp_core therefore runs with this Manager already gone; that is safe
+    // only because the destructor just erases socket-registry entries by fd and
+    // never dereferences the Manager. No event callbacks run during member
+    // destruction, so dht_sendto cannot observe the destroyed Manager in the
+    // window between the two destructors.
+    tr::proxy_protocol::Manager proxy_protocol_;
 
     // monitors the "global pool" speeds
     tr_bandwidth top_bandwidth_{ true };
