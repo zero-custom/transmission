@@ -62,6 +62,9 @@ EOF
 
   mkdir -p "$dest/pkg"
   mv "$dest"/out/* "$dest/pkg/"
+  cp "$wt/COPYING" "$wt/README.md" "$dest/pkg/"
+  mkdir -p "$dest/pkg/public_html"
+  cp -a "$wt/web/public_html/." "$dest/pkg/public_html/"
   ( cd "$dest/pkg" && tar -czf "../transmission-$tag-linux-$LIBC-$ARCH.tar.gz" . )
   rm -rf "$dest/pkg"
   # 源码包跨 libc/架构完全一致，只由 glibc+amd64 组合生成，避免矩阵重复上传同名文件
