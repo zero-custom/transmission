@@ -1,0 +1,142 @@
+# Fork：每日上游同步 —— commit 只同步、不构建。
+#
+# 每天把 fork main rebase 到 upstream main（transmission/transmission）；
+# 同步后检测上游是否有尚未构建的 release，有则通过 workflow_call 链式调用
+# build-release.yml，没有则直接结束。
+#
+# 冲突策略（比照 Xray-core）：
+#   - rebase 冲突 → 直接让本次 job 失败，由人工处理，不自动开 issue。
+#   - 补丁 `git apply --check` 失败 → 自动开/去重 issue，不阻塞同步结果。
+#
+# 本 workflow 是唯一的定时入口；build-release.yml 不再单独定时。
+
+name: Sync Upstream
+
+on:
+  schedule:
+    # Daily at 00:00 UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/transmission/transmission.git
+  PATCH_FILE: patches/transmission-proxy-protocol.patch
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream "$UPSTREAM_REPO" 2>/dev/null || true
+          git fetch upstream main
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*'
+
+      - name: Check for upstream changes
+        id: check
+        run: |
+          if git merge-base --is-ancestor upstream/main origin/main; then
+            echo "Upstream already included — nothing to sync"
+            echo "should_sync=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Upstream has new commits — will sync"
+            echo "should_sync=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rebase main onto upstream/main
+        if: steps.check.outputs.should_sync == 'true'
+        run: |
+          # `git switch`（而非 checkout）避免与仓库根 ./main/ 目录歧义
+          git switch main
+          git rebase upstream/main
+          git push origin main --force-with-lease
+
+      - name: Verify patches still apply (no build)
+        if: steps.check.outputs.should_sync == 'true'
+        id: patchcheck
+        run: |
+          if git apply --check "$PATCH_FILE"; then
+            echo "patch_ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "patch_ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open issue when patch check fails
+        if: steps.check.outputs.should_sync == 'true' && steps.patchcheck.outputs.patch_ok == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          UPSTREAM_SHA=$(git rev-parse --short upstream/main)
+          TITLE="patch check failed after sync to upstream/main ($UPSTREAM_SHA)"
+          if gh issue list --search "$TITLE in:title" --state open --json title \
+              --jq '.[].title' | grep -qx "$TITLE"; then
+            echo "Issue already open for $UPSTREAM_SHA, skipping"
+            exit 0
+          fi
+          git apply --check "$PATCH_FILE" 2>&1 | head -30 > /tmp/patch-check.log || true
+          gh issue create --title "$TITLE" --body "$(cat <<EOF
+          Daily sync rebased \`main\` onto \`upstream/main\` ($UPSTREAM_SHA),
+          but \`$PATCH_FILE\` no longer applies cleanly.
+
+          \`\`\`
+          $(cat /tmp/patch-check.log)
+          \`\`\`
+
+          The sync was still pushed; resolve the patch before the next release.
+          EOF
+          )"
+
+  detect-release:
+    needs: sync
+    runs-on: ubuntu-latest
+    outputs:
+      has_release: ${{ steps.detect.outputs.has_release }}
+      tag: ${{ steps.detect.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Detect pending upstream release
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          out="$(.github/scripts/detect-new-tags.sh '' '0')"
+          tag="$(printf '%s' "$out" | jq -r '.[0]')"
+          if [ -z "$tag" ] || [ "$tag" = "__skip__" ]; then
+            echo "No pending upstream release"
+            echo "has_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Pending upstream release: $tag"
+            echo "has_release=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    needs: detect-release
+    if: needs.detect-release.outputs.has_release == 'true'
+    permissions:
+      contents: write
+      issues: write
+      actions: write
+    uses: ./.github/workflows/build-release.yml
+    with:
+      upstream_tag: ${{ needs.detect-release.outputs.tag }}
