@@ -1,7 +1,8 @@
+# Release 同步：按上游 tag 构建 <tag>-pN（detect → prepare → build → publish）。
+# 触发方式：Sync Upstream 检测到未构建的上游 release 时通过 workflow_call 调用；
+# 也可手动 workflow_dispatch。commit 同步见 sync-upstream.yml。
 name: Build Patched Release
 on:
-  schedule:
-    - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
       upstream_tag:
@@ -13,6 +14,18 @@ on:
         required: false
         default: false
         description: 'tag 已构建时强制重建（生成下一个 -pN；失败不建 issue）'
+  workflow_call:
+    inputs:
+      upstream_tag:
+        type: string
+        required: false
+        default: ''
+        description: '上游 tag（由 Sync Upstream 检测结果传入）；留空则自动检测'
+      force:
+        type: boolean
+        required: false
+        default: false
+        description: 'tag 已构建时强制重建（生成下一个 -pN）'
 
 permissions:
   contents: write
