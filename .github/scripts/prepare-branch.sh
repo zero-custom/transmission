@@ -95,7 +95,11 @@ for tag in "${tags[@]}"; do
     continue
   fi
   head="$(git -C "$wt" rev-parse HEAD)"
-  git -C "$wt" push origin "HEAD:refs/heads/$tag" 2>&1 | tail -1
+  if ! git -C "$wt" push origin "HEAD:refs/heads/$tag" 2>&1; then
+    echo "::error::failed to push branch $tag"
+    git worktree remove --force "$wt" 2>/dev/null || true
+    exit 1
+  fi
   git worktree remove --force "$wt"
   close_conflict_issue "$tag"
   echo "::notice::branch $tag prepared ($head)"
