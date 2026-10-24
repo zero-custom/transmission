@@ -39,6 +39,7 @@
 #include "libtransmission/log.h"
 #include "libtransmission/net.h"
 #include "libtransmission/peer-mgr.h" // for tr_peerMgrCompactToPex()
+#include "libtransmission/proxy-protocol.h"
 #include "libtransmission/quark.h"
 #include "libtransmission/timer.h"
 #include "libtransmission/tr-assert.h"
@@ -90,8 +91,27 @@ extern "C"
 
     int dht_sendto(int sockfd, void const* buf, int len, int flags, struct sockaddr const* to, int tolen)
     {
+        // gost relays DHT traffic; rewrite real client addresses back to the
+        // actual (relay) address so replies traverse the relay
+        auto storage = sockaddr_storage{};
+        auto storage_len = socklen_t{ 0 };
+        auto const* send_to = to;
+        auto send_len = tolen;
+
+        if (auto* const manager = tr::proxy_protocol::find_manager(sockfd); manager != nullptr)
+        {
+            if (auto const rewritten = manager->rewriteOutbound(to); rewritten)
+            {
+                auto const [sa, sa_len] = rewritten->to_sockaddr();
+                storage = sa;
+                storage_len = sa_len;
+                send_to = reinterpret_cast<sockaddr const*>(&storage);
+                send_len = static_cast<int>(storage_len);
+            }
+        }
+
         // NOLINTNEXTLINE(readability-redundant-casting)
-        return static_cast<int>(sendto(sockfd, static_cast<char const*>(buf), len, flags, to, tolen));
+        return static_cast<int>(sendto(sockfd, static_cast<char const*>(buf), len, flags, send_to, send_len));
     }
 
 #if defined(_WIN32) && !defined(__MINGW32__)

@@ -15,6 +15,7 @@
 #include "libtransmission/net.h"
 #include "libtransmission/peer-io.h"
 #include "libtransmission/peer-socket.h"
+#include "libtransmission/proxy-protocol.h"
 #include "libtransmission/session.h"
 #include "libtransmission/tr-assert.h"
 #include "libtransmission/tr-utp.h"
@@ -101,12 +102,21 @@ void utp_on_accept(tr_session* const session, UTPSocket* const utp_sock)
 }
 
 void utp_send_to(
-    tr_session const* const ss,
+    tr_session* const ss,
     uint8_t const* const buf,
     size_t const buflen,
     struct sockaddr const* const to,
     socklen_t const tolen)
 {
+    // gost expects replies to relayed sessions at the actual (relay) address,
+    // not at the real client address the PROXY protocol header mapped us to
+    if (auto const rewritten = ss->proxy_protocol_.rewriteOutbound(to); rewritten)
+    {
+        auto const [storage, storage_len] = rewritten->to_sockaddr();
+        ss->udp_core_->sendto(buf, buflen, reinterpret_cast<sockaddr const*>(&storage), storage_len);
+        return;
+    }
+
     ss->udp_core_->sendto(buf, buflen, to, tolen);
 }
 

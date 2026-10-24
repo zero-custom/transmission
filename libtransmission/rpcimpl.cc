@@ -2420,6 +2420,17 @@ using SessionAccessors = std::pair<SessionGetter, SessionSetter>;
         });
 
     map.try_emplace(
+        TR_KEY_proxy_protocol,
+        [](tr_session const& src) { return src.serialize_proxy_protocol_mode(); },
+        [](tr_session& tgt, tr_variant const& src, ErrorInfo& err)
+        {
+            if (!tgt.deserialize_proxy_protocol_mode(src))
+            {
+                err = { JsonRpc::Error::INVALID_PARAMS, R"(must be one of "off", "allow" or "require")"s };
+            }
+        });
+
+    map.try_emplace(
         TR_KEY_queue_stalled_enabled,
         [](tr_session const& src) -> tr_variant { return src.queueStalledEnabled(); },
         [](tr_session& tgt, tr_variant const& src, ErrorInfo& /*err*/)

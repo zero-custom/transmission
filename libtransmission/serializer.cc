@@ -152,6 +152,62 @@ tr_variant from_encryption_mode(tr_encryption_mode const& val)
 
 // ---
 
+auto constexpr ProxyProtocolKeys = Lookup<tr_proxy_protocol_mode, 3U>{ {
+    { "off", TR_PROXY_PROTOCOL_OFF },
+    { "allow", TR_PROXY_PROTOCOL_ALLOW },
+    { "require", TR_PROXY_PROTOCOL_REQUIRE },
+} };
+
+bool to_proxy_protocol_mode(tr_variant const& src, tr_proxy_protocol_mode* tgt)
+{
+    static constexpr auto& Keys = ProxyProtocolKeys;
+
+    if (auto const val = src.value_if<std::string_view>())
+    {
+        auto const needle = tr_strlower(tr_strv_strip(*val));
+
+        for (auto const& [name, value] : Keys)
+        {
+            if (name == needle)
+            {
+                *tgt = value;
+                return true;
+            }
+        }
+    }
+
+    if (auto const val = src.value_if<int64_t>())
+    {
+        for (auto const& [name, value] : Keys)
+        {
+            if (value == *val)
+            {
+                *tgt = value;
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+tr_variant from_proxy_protocol_mode(tr_proxy_protocol_mode const& val)
+{
+    static constexpr auto& Keys = ProxyProtocolKeys;
+
+    for (auto const& [key, value] : Keys)
+    {
+        if (value == val)
+        {
+            return tr_variant::unmanaged_string(key);
+        }
+    }
+
+    return static_cast<int64_t>(val);
+}
+
+// ---
+
 auto constexpr LogKeys = Lookup<tr_log_level, 7U>{ {
     { "critical", TR_LOG_CRITICAL },
     { "debug", TR_LOG_DEBUG },
@@ -560,6 +616,7 @@ void Converters::ensure_default_converters()
             Converters::add(to_port, from_port);
             Converters::add(to_preallocation_mode, from_preallocation_mode);
             Converters::add(to_preferred_transport, from_preferred_transport);
+            Converters::add(to_proxy_protocol_mode, from_proxy_protocol_mode);
             Converters::add(to_size_t, from_size_t);
             Converters::add(to_string, from_string);
             Converters::add(to_uint64, from_uint64);
