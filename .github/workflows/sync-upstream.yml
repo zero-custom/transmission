@@ -82,18 +82,19 @@ jobs:
 
       - name: Open issue when patch check fails
         if: steps.check.outputs.should_sync == 'true' && steps.patchcheck.outputs.patch_ok == 'false'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           UPSTREAM_SHA=$(git rev-parse --short upstream/main)
           TITLE="patch check failed after sync to upstream/main ($UPSTREAM_SHA)"
-          if gh issue list --search "$TITLE in:title" --state open --json title \
+          if gh issue list --repo "$GITHUB_REPOSITORY" --search "$TITLE in:title" --state open --json title \
               --jq '.[].title' | grep -qx "$TITLE"; then
             echo "Issue already open for $UPSTREAM_SHA, skipping"
             exit 0
           fi
           git apply --check "$PATCH_FILE" 2>&1 | head -30 > /tmp/patch-check.log || true
-          gh issue create --title "$TITLE" --body "$(cat <<EOF
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$(cat <<EOF
           Daily sync rebased \`main\` onto \`upstream/main\` ($UPSTREAM_SHA),
           but \`$PATCH_FILE\` no longer applies cleanly.
 
