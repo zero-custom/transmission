@@ -59,7 +59,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          token: ${{ github.token }}
+          token: ${{ secrets.RELEASE_PUSH_TOKEN }}
       # 补丁作为提交放入 fork 分支 <tag>（= upstream tag + 1 个补丁提交），供 build job 直接检出
       - name: Prepare patched branch
         id: prepare
