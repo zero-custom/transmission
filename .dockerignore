@@ -1,0 +1,5 @@
+.git
+patches
+.github
+docs
+*.tar.gz
